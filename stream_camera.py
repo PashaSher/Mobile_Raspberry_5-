@@ -1,35 +1,35 @@
 #!/usr/bin/env python3
 """
-Видеопоток с камеры на другой ПК / Raspberry Pi по локальной сети (Wi‑Fi).
+Скрипт для Raspberry Pi: передача видео с камеры (CSI/USB через libcamera) по TCP (MJPEG)
+и UDP discovery (handshake в LAN). Запускайте на Pi под Raspberry Pi OS (или совместимой системе).
 
-Схема: приёмник слушает TCP-порт, передатчик подключается к IP приёмника и шлёт MJPEG.
+Слушать сеть и стримить после подключения клиента (типичный режим на Pi):
+  python stream_camera.py send --listen --port 5000 --no-set-fps
 
-Приёмник (картинка в браузере, без X11):
-  python stream_camera.py receive --port 5000 --http 8080
-
-Передатчик с автопоиском приёмника в той же Wi‑Fi сети (UDP handshake):
-  python stream_camera.py send --host auto
-
-Передатчик с явным IP:
-  python stream_camera.py send --host 192.168.1.50 --port 5000
-
-Автозапуск на Raspberry с камерой (ждёт handshake и TCP, потом стрим).
-  На Pi 5 с CSI чаще нужен libcamera:
+По умолчанию на Raspberry Pi выбирается захват через picamera2 (libcamera). Явно:
   python stream_camera.py send --listen --port 5000 --capture picamera2 --no-set-fps
 
-Просмотр на ПК, подключение к Pi (receive как клиент):
-  python stream_camera.py receive --http 8080 --peer auto
+Передатчик сам ищет приёмник по UDP и подключается к нему:
+  python stream_camera.py send --host auto
 
-Список Wi‑Fi сетей (если установлен nmcli):
+Или явный IP приёмника:
+  python stream_camera.py send --host 192.168.1.50 --port 5000
+
+Утилита Wi‑Fi (nmcli на Pi):
   python stream_camera.py wifi-scan
 
-Окно OpenCV (нужен opencv-python с GTK, не headless):
-  python stream_camera.py receive --port 5000 --gui
+Протокол для приложения на другом устройстве (ПК и т.д.)
+--------------------------------------------------------
+TCP (порт по умолчанию 5000): поток кадров. Каждый кадр — 4 байта big-endian uint32
+длина JPEG, затем ровно столько байт сжатого JPEG.
 
-Логи в консоль (удобно по SSH): --log-level DEBUG или -v
-Дата/время на кадре (на стороне камеры): send ... --timestamp
+UDP broadcast, порт 37020 (по умолчанию): запрос discover от клиента (JSON):
+  {"v":1,"cmd":"discover","token":"<строка или пусто>"}
+Ответ от Pi (send --listen с включённым discovery):
+  {"v":1,"cmd":"hello","tcp":5000,"name":"<hostname>","http":null}
+Поле http зарезервировано; можно игнорировать.
 
-SSH и стрим с одного ПК: да — SSH (порт 22) и видео (TCP/HTTP/UDP) не мешают друг другу.
+Логи: --log-level DEBUG или -v. Дата/время на кадре: send ... --timestamp
 """
 
 from __future__ import annotations
@@ -44,8 +44,6 @@ import subprocess
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
 
 # UDP discovery (handshake в локальной сети после подключения к Wi‑Fi)
 DISCOVERY_PORT_DEFAULT = 37020
@@ -54,6 +52,20 @@ DISCOVERY_REQ = "discover"
 DISCOVERY_RSP = "hello"
 
 log = logging.getLogger("camstream")
+
+
+def _is_raspberry_pi() -> bool:
+    """Определение платы по device-tree (работает на Raspberry Pi OS)."""
+    try:
+        with open("/proc/device-tree/model", "rb") as f:
+            return b"Raspberry Pi" in f.read()
+    except OSError:
+        return False
+
+
+def _default_capture_mode() -> str:
+    """На Raspberry Pi по умолчанию libcamera (picamera2); иначе — перебор OpenCV."""
+    return "picamera2" if _is_raspberry_pi() else "auto"
 
 
 def setup_logging(level: int) -> None:
@@ -67,22 +79,6 @@ def setup_logging(level: int) -> None:
         logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
     root.addHandler(h)
-
-
-# --- приём TCP: общий буфер последнего JPEG ---
-
-_frame_lock = threading.Lock()
-_latest_jpeg: bytes | None = None
-
-
-def recv_exact(sock: socket.socket, n: int) -> bytes | None:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
 
 
 def _discovery_request_payload(token: str) -> bytes:
@@ -117,7 +113,7 @@ def discover_receivers(
     wait_after_send: float = 0.15,
 ) -> list[tuple[str, int, int | None, str | None]]:
     """
-    Шлёт UDP broadcast и собирает ответы приёмников.
+    Шлёт UDP broadcast и собирает ответы на handshake (discover).
     Возвращает список (ip, tcp_port, http_port|None, name).
     """
     log.info("discovery: широковещательный запрос UDP → порт %s, таймаут %.1f с", discover_port, timeout)
@@ -260,34 +256,6 @@ def run_wifi_scan() -> None:
         log.info("%s", ln)
 
 
-def _tcp_ingest_loop(conn: socket.socket) -> None:
-    global _latest_jpeg
-    n = 0
-    last_stat = time.monotonic()
-    while True:
-        hdr = recv_exact(conn, 4)
-        if hdr is None:
-            log.info("приём: соединение закрыто или заголовок не получен (кадров: %d)", n)
-            break
-        (length,) = struct.unpack(">I", hdr)
-        if length > 50 * 1024 * 1024:
-            log.warning("приём: подозрительный размер кадра %d, выход", length)
-            break
-        data = recv_exact(conn, length)
-        if data is None or len(data) != length:
-            log.info("приём: обрыв данных (кадров: %d)", n)
-            break
-        with _frame_lock:
-            _latest_jpeg = data
-        n += 1
-        if n == 1:
-            log.info("приём: первый кадр получен (~%d байт JPEG)", len(data))
-        now = time.monotonic()
-        if now - last_stat >= 5.0:
-            log.info("приём: получено кадров за сессию: %d", n)
-            last_stat = now
-
-
 def _draw_timestamp_on_frame(frame, enabled: bool) -> None:
     if not enabled:
         return
@@ -391,6 +359,13 @@ def _picamera2_stream_to_socket(
     picam2.start()
     log.info("picamera2: камера запущена %dx%d (libcamera)", w, h)
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+    try:
+        import simplejpeg  # type: ignore[import-untyped]
+
+        _simplejpeg_ok = True
+    except ImportError:
+        simplejpeg = None  # type: ignore[misc, assignment]
+        _simplejpeg_ok = False
     n = 0
     last_stat = time.monotonic()
     try:
@@ -400,15 +375,34 @@ def _picamera2_stream_to_socket(
                 frame = np.ascontiguousarray(frame)
             if frame.ndim == 2:
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                _draw_timestamp_on_frame(frame_bgr, overlay_timestamp)
+                ok, jpeg = cv2.imencode(".jpg", frame_bgr, encode_params)
+                if not ok:
+                    continue
+                payload = jpeg.tobytes()
             elif frame.shape[2] >= 3:
-                frame_bgr = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
+                rgb = np.ascontiguousarray(frame[:, :, :3])
+                if overlay_timestamp:
+                    frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    _draw_timestamp_on_frame(frame_bgr, overlay_timestamp)
+                    ok, jpeg = cv2.imencode(".jpg", frame_bgr, encode_params)
+                    if not ok:
+                        continue
+                    payload = jpeg.tobytes()
+                elif _simplejpeg_ok:
+                    payload = simplejpeg.encode_jpeg(
+                        rgb,
+                        quality=int(max(1, min(100, jpeg_quality))),
+                        colorspace="RGB",
+                    )
+                else:
+                    frame_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                    ok, jpeg = cv2.imencode(".jpg", frame_bgr, encode_params)
+                    if not ok:
+                        continue
+                    payload = jpeg.tobytes()
             else:
                 continue
-            _draw_timestamp_on_frame(frame_bgr, overlay_timestamp)
-            ok, jpeg = cv2.imencode(".jpg", frame_bgr, encode_params)
-            if not ok:
-                continue
-            payload = jpeg.tobytes()
             header = struct.pack(">I", len(payload))
             sock.sendall(header + payload)
             n += 1
@@ -666,13 +660,13 @@ def run_send(
                 break
             if not discover_loop:
                 log.error(
-                    "Приёмник не найден по UDP. Запустите receive на другой машине в той же Wi‑Fi сети "
-                    "или укажите IP: --host <адрес>. Порт discovery: %s.",
+                    "По UDP никто не ответил на discover. На ПК должно быть приложение с тем же портом handshake "
+                    "или укажите IP вручную: --host <адрес>. Порт discovery: %s.",
                     discover_port,
                 )
                 sys.exit(1)
             log.warning(
-                "Приёмника нет, повтор через %.1f с (Ctrl+C — выход) ...",
+                "Ответа discover нет, повтор через %.1f с (Ctrl+C — выход) ...",
                 discover_loop_interval,
             )
             time.sleep(discover_loop_interval)
@@ -681,7 +675,7 @@ def run_send(
             log.error("Индекс %s вне диапазона (найдено %d).", discover_index, len(peers))
             sys.exit(1)
         if len(peers) > 1:
-            log.info("Найдено несколько приёмников (см. --discover-index):")
+            log.info("Найдено несколько ответов discover (см. --discover-index):")
             for i, p in enumerate(peers):
                 ip_i, tcp_i, http_i, name_i = p
                 extra = f" ({name_i})" if name_i else ""
@@ -690,7 +684,7 @@ def run_send(
         ip, tcp_p, http_p, name = peers[discover_index]
         host = ip
         port = tcp_p
-        log.info("Выбран приёмник #%d: %s:%s%s", discover_index, host, port, f" ({name})" if name else "")
+        log.info("Выбран хост #%d: %s:%s%s", discover_index, host, port, f" ({name})" if name else "")
         if http_p is not None:
             log.info("Просмотр в браузере: http://%s:%s/", host, http_p)
 
@@ -754,277 +748,10 @@ def run_send(
         log.info("send: завершено")
 
 
-def _make_mjpeg_handler(boundary_token: str) -> type[BaseHTTPRequestHandler]:
-    b = boundary_token.encode("ascii")
-
-    class MJPEGHandler(BaseHTTPRequestHandler):
-        protocol_version = "HTTP/1.1"
-
-        def log_message(self, format: str, *args: object) -> None:
-            msg = format % args if args else format
-            log.info('HTTP %s "%s"', self.address_string(), msg.strip())
-
-        def do_GET(self) -> None:
-            path = urlparse(self.path).path
-
-            if path in ("/", "/index.html"):
-                # MJPEG multipart в <img src="/stream"> часто даёт чёрный экран в Edge/Chrome;
-                # опрос /snapshot совместим со всеми браузерами.
-                html = (
-                    "<!DOCTYPE html><html><head><meta charset=utf-8>"
-                    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
-                    "<title>Камера</title><style>body{margin:0;background:#111;"
-                    "display:flex;justify-content:center;align-items:center;"
-                    "min-height:100vh}</style></head><body>"
-                    '<img id="cam" alt="камера" style="max-width:100%;height:auto;min-height:240px;'
-                    'background:#222;object-fit:contain" />'
-                    "<script>"
-                    "var el=document.getElementById('cam');"
-                    "function u(){el.src='/snapshot?t='+Date.now();}"
-                    "setInterval(u,66);u();"
-                    "</script>"
-                    "<p style=color:#888;font:12px sans-serif;text-align:center>"
-                    "Если пусто: откройте /snapshot в новой вкладке. "
-                    "Поток MJPEG: <a href=\"/stream\" style=color:#8cf>/stream</a> (лучше в Firefox)."
-                    "</p></body></html>"
-                )
-                data = html.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-                return
-
-            if path == "/snapshot":
-                with _frame_lock:
-                    jpeg = _latest_jpeg
-                if jpeg is None:
-                    self.send_response(503)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(b"no frame yet")
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "image/jpeg")
-                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-                self.send_header("Content-Length", str(len(jpeg)))
-                self.end_headers()
-                self.wfile.write(jpeg)
-                return
-
-            if path != "/stream":
-                self.send_error(404)
-                return
-
-            self.send_response(200)
-            self.send_header(
-                "Content-Type",
-                f"multipart/x-mixed-replace; boundary={boundary_token}",
-            )
-            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
-            self.send_header("Pragma", "no-cache")
-            self.end_headers()
-            try:
-                while True:
-                    with _frame_lock:
-                        jpeg = _latest_jpeg
-                    if jpeg is None:
-                        time.sleep(0.02)
-                        continue
-                    self.wfile.write(b"--" + b + b"\r\n")
-                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
-                    self.wfile.write(f"Content-Length: {len(jpeg)}\r\n\r\n".encode())
-                    self.wfile.write(jpeg)
-                    self.wfile.write(b"\r\n")
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-
-    return MJPEGHandler
-
-
-def _resolve_peer_tcp(
-    peer: str,
-    tcp_port: int,
-    discover_port: int,
-    discover_token: str | None,
-    discover_index: int,
-    discover_timeout: float,
-) -> tuple[str, int]:
-    if peer.strip().lower() in ("auto", "discover"):
-        tok = discover_token or ""
-        peers = discover_receivers(discover_port, tok, discover_timeout)
-        if not peers:
-            log.error(
-                "Устройство с камерой не найдено по UDP. На Pi: send --listen в той же сети или --peer <IP>."
-            )
-            sys.exit(1)
-        if discover_index < 0 or discover_index >= len(peers):
-            log.error("Индекс %s вне диапазона (найдено %d).", discover_index, len(peers))
-            sys.exit(1)
-        if len(peers) > 1:
-            log.info("Найдено несколько устройств (см. --discover-index):")
-            for i, p in enumerate(peers):
-                ip_i, tcp_i, http_i, name_i = p
-                extra = f" ({name_i})" if name_i else ""
-                http_s = f" http={http_i}" if http_i is not None else ""
-                log.info("  [%d] %s tcp=%s%s%s", i, ip_i, tcp_i, http_s, extra)
-        ip, tcp_p, _, name = peers[discover_index]
-        log.info("receive: цель %s:%s%s", ip, tcp_p, f" ({name})" if name else "")
-        return ip, tcp_p
-    return peer.strip(), tcp_port
-
-
-def run_receive_http(
-    tcp_port: int,
-    http_port: int,
-    discover_port: int | None,
-    discover_token: str | None,
-    peer: str | None,
-    discover_index: int,
-    discover_timeout: float,
-) -> None:
-    global _latest_jpeg
-
-    if peer is None:
-        log.info("receive: режим сервера (ждём входящий TCP поток с камеры)")
-        if discover_port is not None:
-            try:
-                _start_discovery_responder(discover_port, tcp_port, http_port, discover_token)
-            except OSError:
-                sys.exit(1)
-            log.info(
-                "UDP discovery ответчик на порту %s%s",
-                discover_port,
-                " (токен на передатчике)" if discover_token else "",
-            )
-
-        tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        tcp_srv.bind(("0.0.0.0", tcp_port))
-        tcp_srv.listen(1)
-        log.info("TCP: ожидание камеры на 0.0.0.0:%s ...", tcp_port)
-
-        handler = _make_mjpeg_handler("mjpegframe")
-        httpd = ThreadingHTTPServer(("0.0.0.0", http_port), handler)
-        http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        http_thread.start()
-        log.info("HTTP: веб-интерфейс http://<этот_IP>:%s/", http_port)
-
-        conn, addr = tcp_srv.accept()
-        tcp_srv.close()
-        log.info("TCP: поток с камеры подключился с %s:%s", addr[0], addr[1])
-    else:
-        log.info("receive: режим клиента, peer=%s", peer)
-        dp = discover_port if discover_port is not None else DISCOVERY_PORT_DEFAULT
-        rh, rport = _resolve_peer_tcp(
-            peer, tcp_port, dp, discover_token, discover_index, discover_timeout
-        )
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log.info("TCP: соединение с %s:%s ...", rh, rport)
-        try:
-            conn.connect((rh, rport))
-        except OSError as e:
-            log.error("TCP к %s:%s: %s", rh, rport, e)
-            sys.exit(1)
-        log.info("TCP: подключено к потоку %s:%s", rh, rport)
-
-        with _frame_lock:
-            _latest_jpeg = None
-
-        handler = _make_mjpeg_handler("mjpegframe")
-        httpd = ThreadingHTTPServer(("0.0.0.0", http_port), handler)
-        http_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        http_thread.start()
-        log.info("HTTP: откройте http://127.0.0.1:%s/ или http://<этот_ПК>:%s/", http_port, http_port)
-
-    log.info("приём: поток декодирования JPEG запущен")
-    ingest = threading.Thread(target=_tcp_ingest_loop, args=(conn,), daemon=True)
-    ingest.start()
-    ingest.join()
-    conn.close()
-    httpd.shutdown()
-    log.info("receive: HTTP и TCP закрыты")
-
-
-def run_receive_gui(
-    tcp_port: int,
-    camera_label: str,
-    discover_port: int | None,
-    discover_token: str | None,
-    peer: str | None,
-    discover_index: int,
-    discover_timeout: float,
-) -> None:
-    import cv2
-    import numpy as np
-
-    if peer is None:
-        log.info("receive/gui: режим сервера")
-        if discover_port is not None:
-            try:
-                _start_discovery_responder(discover_port, tcp_port, None, discover_token)
-            except OSError:
-                sys.exit(1)
-            log.info(
-                "UDP discovery на порту %s%s",
-                discover_port,
-                " (токен на передатчике)" if discover_token else "",
-            )
-
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", tcp_port))
-        server.listen(1)
-        log.info("TCP: ожидание на 0.0.0.0:%s ...", tcp_port)
-
-        conn, addr = server.accept()
-        server.close()
-        log.info("TCP: подключение с %s:%s", addr[0], addr[1])
-    else:
-        log.info("receive/gui: режим клиента, peer=%s", peer)
-        dp = discover_port if discover_port is not None else DISCOVERY_PORT_DEFAULT
-        rh, rport = _resolve_peer_tcp(
-            peer, tcp_port, dp, discover_token, discover_index, discover_timeout
-        )
-        conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        log.info("TCP: соединение с %s:%s ...", rh, rport)
-        try:
-            conn.connect((rh, rport))
-        except OSError as e:
-            log.error("TCP к %s:%s: %s", rh, rport, e)
-            sys.exit(1)
-        log.info("TCP: подключено к %s:%s", rh, rport)
-
-    window = f"Поток {camera_label}"
-    try:
-        while True:
-            hdr = recv_exact(conn, 4)
-            if hdr is None:
-                break
-            (length,) = struct.unpack(">I", hdr)
-            if length > 50 * 1024 * 1024:
-                log.warning("Некорректный размер кадра %d", length)
-                break
-            data = recv_exact(conn, length)
-            if data is None or len(data) != length:
-                break
-            arr = np.frombuffer(data, dtype=np.uint8)
-            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if frame is None:
-                continue
-            cv2.imshow(window, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    finally:
-        conn.close()
-        cv2.destroyAllWindows()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Стрим камеры по TCP (MJPEG)")
+    parser = argparse.ArgumentParser(
+        description="Raspberry Pi: передача видео с камеры по TCP (MJPEG) + UDP discovery"
+    )
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -1040,11 +767,11 @@ def main() -> None:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_send = sub.add_parser("send", help="Передатчик (камера на этой машине)")
+    p_send = sub.add_parser("send", help="Стрим камеры Raspberry Pi")
     p_send.add_argument(
         "--host",
         default="auto",
-        help="IP приёмника в LAN или auto — поиск по UDP (должен быть запущен receive)",
+        help="IP приёмника в LAN или auto — поиск по UDP (приложение на ПК должно отвечать на discover)",
     )
     p_send.add_argument(
         "--port",
@@ -1061,12 +788,12 @@ def main() -> None:
         "--discover-port",
         type=int,
         default=DISCOVERY_PORT_DEFAULT,
-        help="UDP-порт handshake (тот же, что у receive)",
+        help="UDP-порт handshake (тот же, что слушает ваше приложение на ПК)",
     )
     p_send.add_argument(
         "--discover-token",
         default=None,
-        help="Тот же секрет, что задан на receive (если используется)",
+        help="Секрет для UDP discover (должен совпадать с клиентом на ПК)",
     )
     p_send.add_argument(
         "--discover-timeout",
@@ -1078,12 +805,12 @@ def main() -> None:
         "--discover-index",
         type=int,
         default=0,
-        help="Если найдено несколько приёмников — номер в списке (0 по умолчанию)",
+        help="Если найдено несколько ответов discover — номер в списке (0 по умолчанию)",
     )
     p_send.add_argument(
         "--discover-loop",
         action="store_true",
-        help="Повторять поиск, пока приёмник не появится в сети",
+        help="Повторять поиск, пока по UDP не появится приёмник",
     )
     p_send.add_argument(
         "--discover-loop-interval",
@@ -1126,60 +853,8 @@ def main() -> None:
     p_send.add_argument(
         "--capture",
         choices=["auto", "opencv", "picamera2"],
-        default="auto",
-        help="Захват: auto — OpenCV, при неудаче picamera2; на Pi 5 с CSI часто нужен picamera2",
-    )
-
-    p_recv = sub.add_parser("receive", help="Приёмник")
-    p_recv.add_argument("--port", type=int, default=5000, help="TCP-порт для подключения камеры")
-    p_recv.add_argument(
-        "--http",
-        type=int,
-        nargs="?",
-        const=8080,
-        default=None,
-        metavar="PORT",
-        help="Показ в браузере (порт HTTP, по умолчанию 8080). Рекомендуется для Pi без монитора.",
-    )
-    p_recv.add_argument(
-        "--gui",
-        action="store_true",
-        help="Окно OpenCV (нужен opencv-python с поддержкой GUI, не headless)",
-    )
-    p_recv.add_argument("--title", default="камера", help="Заголовок окна (только с --gui)")
-    p_recv.add_argument(
-        "--discover-port",
-        type=int,
-        default=DISCOVERY_PORT_DEFAULT,
-        help="UDP-порт для ответа на запросы discover (0 = отключить)",
-    )
-    p_recv.add_argument(
-        "--no-discovery",
-        action="store_true",
-        help="Не отвечать на UDP discovery (только ручной IP)",
-    )
-    p_recv.add_argument(
-        "--discover-token",
-        default=None,
-        help="Секрет: отвечать только клиентам с тем же токеном",
-    )
-    p_recv.add_argument(
-        "--peer",
-        default=None,
-        metavar="HOST_OR_auto",
-        help="Подключиться к хосту с камерой (IP или auto). Иначе режим сервера (ждёт send).",
-    )
-    p_recv.add_argument(
-        "--discover-index",
-        type=int,
-        default=0,
-        help="При --peer auto — номер устройства в списке discovery",
-    )
-    p_recv.add_argument(
-        "--discover-timeout",
-        type=float,
-        default=5.0,
-        help="Таймаут discovery при --peer auto",
+        default=_default_capture_mode(),
+        help="Захват: на Raspberry Pi по умолчанию picamera2; auto — OpenCV, при неудаче picamera2; opencv — только OpenCV",
     )
 
     sub.add_parser("wifi-scan", help="Показать доступные Wi‑Fi сети (nmcli)")
@@ -1227,41 +902,6 @@ def main() -> None:
             args.capture,
         )
         return
-
-    if args.gui and args.http is not None:
-        print("Используйте только один режим: --http или --gui", file=sys.stderr)
-        sys.exit(1)
-
-    disc_port = None if args.no_discovery or args.discover_port == 0 else args.discover_port
-    disc_tok = args.discover_token if args.discover_token else None
-
-    if args.gui:
-        run_receive_gui(
-            args.port,
-            args.title,
-            disc_port,
-            disc_tok,
-            args.peer,
-            args.discover_index,
-            args.discover_timeout,
-        )
-    elif args.http is not None:
-        run_receive_http(
-            args.port,
-            args.http,
-            disc_port,
-            disc_tok,
-            args.peer,
-            args.discover_index,
-            args.discover_timeout,
-        )
-    else:
-        print(
-            "Укажите режим: --http [ПОРТ] (браузер) или --gui (окно OpenCV).\n"
-            "Пример: python stream_camera.py receive --port 5000 --http 8080",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
 
 if __name__ == "__main__":
