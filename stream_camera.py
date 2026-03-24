@@ -13,8 +13,9 @@
 Передатчик с явным IP:
   python stream_camera.py send --host 192.168.1.50 --port 5000
 
-Автозапуск на Raspberry с камерой (ждёт handshake и TCP, потом стрим):
-  python stream_camera.py send --listen --port 5000
+Автозапуск на Raspberry с камерой (ждёт handshake и TCP, потом стрим).
+  На Pi 5 с CSI чаще нужен libcamera:
+  python stream_camera.py send --listen --port 5000 --capture picamera2 --no-set-fps
 
 Просмотр на ПК, подключение к Pi (receive как клиент):
   python stream_camera.py receive --http 8080 --peer auto
@@ -36,6 +37,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import socket
 import struct
 import subprocess
@@ -43,6 +45,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 # UDP discovery (handshake в локальной сети после подключения к Wi‑Fi)
 DISCOVERY_PORT_DEFAULT = 37020
@@ -304,26 +307,195 @@ def _draw_timestamp_on_frame(frame, enabled: bool) -> None:
     )
 
 
+def _frame_looks_valid(frame: object | None) -> bool:
+    if frame is None:
+        return False
+    try:
+        shape = getattr(frame, "shape", None)
+        if shape is None or len(shape) < 2:
+            return False
+        h, w = int(shape[0]), int(shape[1])
+        return h >= 8 and w >= 8
+    except Exception:
+        return False
+
+
+def _warmup_camera(cap, max_tries: int = 45) -> tuple[bool, object | None]:
+    import cv2
+
+    for _ in range(max_tries):
+        ok, frame = cap.read()
+        if ok and _frame_looks_valid(frame):
+            return True, frame
+        time.sleep(0.05)
+    return False, None
+
+
+def _ensure_libcamera_on_sys_path() -> None:
+    """venv без --system-site-packages не видит python3-libcamera из apt (Raspberry Pi OS)."""
+    try:
+        import libcamera  # noqa: F401
+        return
+    except ImportError:
+        pass
+    ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    for root in (
+        f"/usr/lib/python{ver}/dist-packages",
+        "/usr/lib/python3/dist-packages",
+    ):
+        if os.path.isdir(os.path.join(root, "libcamera")) and root not in sys.path:
+            sys.path.insert(0, root)
+            return
+
+
+def _picamera2_stream_to_socket(
+    sock: socket.socket,
+    width: int,
+    height: int,
+    jpeg_quality: int,
+    overlay_timestamp: bool,
+) -> None:
+    """Захват через libcamera (picamera2) — на Pi 5 OpenCV/V4L2 часто не отдаёт кадры."""
+    _ensure_libcamera_on_sys_path()
+    try:
+        from picamera2 import Picamera2
+    except ImportError:
+        log.error(
+            "Нужны python3-libcamera и picamera2: sudo apt install -y python3-libcamera; "
+            "pip install picamera2 (для сборки python-prctl: sudo apt install -y libcap2-dev)."
+        )
+        raise
+
+    import cv2
+    import numpy as np
+
+    w = max(64, int(width))
+    h = max(64, int(height))
+    w = (w // 2) * 2
+    h = (h // 2) * 2
+
+    picam2 = Picamera2()
+    cfg = picam2.create_video_configuration(
+        main={"size": (w, h), "format": "RGB888"},
+    )
+    try:
+        picam2.configure(cfg)
+    except Exception as e:
+        log.warning("picamera2: конфиг %dx%d не подошёл (%s), пробуем 640x480", w, h, e)
+        w, h = 640, 480
+        cfg = picam2.create_video_configuration(
+            main={"size": (w, h), "format": "RGB888"},
+        )
+        picam2.configure(cfg)
+
+    picam2.start()
+    log.info("picamera2: камера запущена %dx%d (libcamera)", w, h)
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+    n = 0
+    last_stat = time.monotonic()
+    try:
+        while True:
+            frame = picam2.capture_array("main")
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            if frame.ndim == 2:
+                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif frame.shape[2] >= 3:
+                frame_bgr = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_RGB2BGR)
+            else:
+                continue
+            _draw_timestamp_on_frame(frame_bgr, overlay_timestamp)
+            ok, jpeg = cv2.imencode(".jpg", frame_bgr, encode_params)
+            if not ok:
+                continue
+            payload = jpeg.tobytes()
+            header = struct.pack(">I", len(payload))
+            sock.sendall(header + payload)
+            n += 1
+            if n == 1:
+                log.info("picamera2: первый кадр отправлен (~%d байт JPEG)", len(payload))
+            now = time.monotonic()
+            if now - last_stat >= 5.0:
+                log.info("picamera2: отправлено кадров за сессию: %d", n)
+                last_stat = now
+    finally:
+        try:
+            picam2.stop()
+        except Exception:
+            pass
+        try:
+            picam2.close()
+        except Exception:
+            pass
+
+
+def _try_opencv_capture(
+    camera: int,
+    camera_device: str | None,
+    capture_backend: str,
+    width: int,
+    height: int,
+    fps: float,
+    set_fps: bool,
+) -> tuple[object | None, object | None]:
+    import cv2
+
+    attempts: list[tuple[str, object]] = []
+    if camera_device:
+        attempts.append(("path", cv2.VideoCapture(camera_device, cv2.CAP_V4L2)))
+    if capture_backend == "v4l2":
+        attempts.append(("v4l2", cv2.VideoCapture(camera, cv2.CAP_V4L2)))
+    elif capture_backend == "default":
+        attempts.append(("default", cv2.VideoCapture(camera)))
+    else:
+        attempts.append(("v4l2", cv2.VideoCapture(camera, cv2.CAP_V4L2)))
+        attempts.append(("default", cv2.VideoCapture(camera)))
+
+    for label, cap in attempts:
+        if not cap.isOpened():
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        if set_fps:
+            cap.set(cv2.CAP_PROP_FPS, fps)
+        ok, fr = _warmup_camera(cap)
+        if ok and fr is not None:
+            log.info("камера: OpenCV (%s), %dx%d @%.1f fps", label, width, height, fps)
+            return cap, fr
+        cap.release()
+    return None, None
+
+
 def _camera_stream_to_socket(
     sock: socket.socket,
     cap,
     jpeg_quality: int,
     overlay_timestamp: bool,
+    first_frame: object | None = None,
 ) -> None:
     import cv2
+
+    if first_frame is not None:
+        ok, frame = True, first_frame
+    else:
+        ok, frame = _warmup_camera(cap)
+    if not ok or frame is None:
+        log.warning("камера: нет валидного кадра после прогрева")
+        return
 
     encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
     n = 0
     last_stat = time.monotonic()
     while True:
-        ok, frame = cap.read()
-        if not ok:
-            log.warning("камера: кадр не прочитан, конец стрима (отправлено кадров: %d)", n)
-            break
         _draw_timestamp_on_frame(frame, overlay_timestamp)
         ok, jpeg = cv2.imencode(".jpg", frame, encode_params)
         if not ok:
             log.debug("камера: пропуск кадра (imencode failed)")
+            ok, frame = cap.read()
+            if not ok or not _frame_looks_valid(frame):
+                log.warning("камера: кадр не прочитан, конец стрима (отправлено кадров: %d)", n)
+                break
             continue
         payload = jpeg.tobytes()
         header = struct.pack(">I", len(payload))
@@ -335,6 +507,11 @@ def _camera_stream_to_socket(
         if now - last_stat >= 5.0:
             log.info("камера: отправлено кадров за сессию: %d", n)
             last_stat = now
+
+        ok, frame = cap.read()
+        if not ok or not _frame_looks_valid(frame):
+            log.warning("камера: кадр не прочитан, конец стрима (отправлено кадров: %d)", n)
+            break
 
 
 def run_send_listen(
@@ -348,13 +525,15 @@ def run_send_listen(
     discover_token: str | None,
     http_advertise: int | None,
     overlay_timestamp: bool,
+    camera_device: str | None,
+    capture_backend: str,
+    set_fps: bool,
+    capture_mode: str,
 ) -> None:
     """
     Пассивный режим для автозапуска на Pi: UDP discovery + ожидание TCP,
     после accept открывается камера и идёт тот же поток MJPEG.
     """
-    import cv2
-
     if discover_port is not None:
         try:
             _start_discovery_responder(discover_port, tcp_port, http_advertise, discover_token)
@@ -367,6 +546,8 @@ def run_send_listen(
         )
     else:
         log.info("режим listen: UDP discovery отключён (--no-discovery)")
+
+    log.info("send: режим захвата=%s", capture_mode)
 
     tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -383,29 +564,49 @@ def run_send_listen(
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         log.info("TCP: входящее подключение с %s:%s", addr[0], addr[1])
 
-        cap = cv2.VideoCapture(camera, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(camera)
-        if not cap.isOpened():
-            log.error("камера: устройство %s недоступно, закрываем сокет клиента", camera)
+        if capture_mode == "picamera2":
+            log.info("камера: режим picamera2 (libcamera), %dx%d", width, height)
+            try:
+                _picamera2_stream_to_socket(conn, width, height, jpeg_quality, overlay_timestamp)
+            except BrokenPipeError:
+                log.warning("TCP: клиент отключился (BrokenPipe)")
+            except ImportError:
+                log.error(
+                    "Установите: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2"
+                )
+            finally:
+                conn.close()
+                log.info("сессия завершена, снова ожидание клиента на TCP %s ...", tcp_port)
+            continue
+
+        cap, first_fr = _try_opencv_capture(
+            camera, camera_device, capture_backend, width, height, fps, set_fps
+        )
+        if cap is None and capture_mode == "auto":
+            log.info("OpenCV не дал кадр — переключение на picamera2 (типично для Pi 5 + libcamera)")
+            try:
+                _picamera2_stream_to_socket(conn, width, height, jpeg_quality, overlay_timestamp)
+            except BrokenPipeError:
+                log.warning("TCP: клиент отключился (BrokenPipe)")
+            except ImportError:
+                log.error(
+                    "Установите: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2"
+                )
+            finally:
+                conn.close()
+                log.info("сессия завершена, снова ожидание клиента на TCP %s ...", tcp_port)
+            continue
+
+        if cap is None:
+            log.error(
+                "камера: OpenCV не дал кадр. На Pi 5: --capture picamera2 или --capture auto, "
+                "pip install picamera2 и python3-libcamera."
+            )
             conn.close()
             continue
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        cap.set(cv2.CAP_PROP_FPS, fps)
-        log.info(
-            "камера: открыта %s, %dx%d @%.1f fps, JPEG %d, timestamp=%s",
-            camera,
-            width,
-            height,
-            fps,
-            jpeg_quality,
-            overlay_timestamp,
-        )
-
         try:
-            _camera_stream_to_socket(conn, cap, jpeg_quality, overlay_timestamp)
+            _camera_stream_to_socket(conn, cap, jpeg_quality, overlay_timestamp, first_fr)
         except BrokenPipeError:
             log.warning("TCP: клиент отключился (BrokenPipe)")
         finally:
@@ -432,9 +633,11 @@ def run_send(
     listen_discover_port: int | None,
     listen_http_advertise: int | None,
     overlay_timestamp: bool,
+    camera_device: str | None,
+    capture_backend: str,
+    set_fps: bool,
+    capture_mode: str,
 ) -> None:
-    import cv2
-
     if listen:
         run_send_listen(
             port,
@@ -447,6 +650,10 @@ def run_send(
             discover_token,
             listen_http_advertise,
             overlay_timestamp,
+            camera_device,
+            capture_backend,
+            set_fps,
+            capture_mode,
         )
         return
 
@@ -487,26 +694,7 @@ def run_send(
         if http_p is not None:
             log.info("Просмотр в браузере: http://%s:%s/", host, http_p)
 
-    log.info(
-        "send: открытие камеры %s, %dx%d @%.1f fps, JPEG %d, timestamp=%s",
-        camera,
-        width,
-        height,
-        fps,
-        jpeg_quality,
-        overlay_timestamp,
-    )
-    cap = cv2.VideoCapture(camera, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(camera)
-
-    if not cap.isOpened():
-        log.error("камера: не удалось открыть устройство %s", camera)
-        sys.exit(1)
-
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
+    log.info("send: режим захвата=%s", capture_mode)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -515,19 +703,55 @@ def run_send(
         sock.connect((host, port))
     except OSError as e:
         log.error("TCP: подключение к %s:%s не удалось: %s", host, port, e)
-        cap.release()
         sys.exit(1)
 
     log.info("TCP: соединение установлено, стрим активен (Ctrl+C — выход)")
 
+    if capture_mode == "picamera2":
+        try:
+            _picamera2_stream_to_socket(sock, width, height, jpeg_quality, overlay_timestamp)
+        except BrokenPipeError:
+            log.warning("TCP: соединение разорвано приёмником")
+        except ImportError:
+            log.error(
+                "Установите: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2"
+            )
+        finally:
+            sock.close()
+            log.info("send: завершено")
+        return
+
+    cap, first_fr = _try_opencv_capture(
+        camera, camera_device, capture_backend, width, height, fps, set_fps
+    )
+    if cap is not None:
+        try:
+            _camera_stream_to_socket(sock, cap, jpeg_quality, overlay_timestamp, first_fr)
+        except BrokenPipeError:
+            log.warning("TCP: соединение разорвано приёмником")
+        finally:
+            cap.release()
+            sock.close()
+            log.info("send: камера и сокет закрыты")
+        return
+
+    if capture_mode == "opencv":
+        log.error("камера: OpenCV не дал кадр (попробуйте --capture auto или picamera2)")
+        sock.close()
+        sys.exit(1)
+
+    log.info("OpenCV не дал кадр — пробуем picamera2 (libcamera) …")
     try:
-        _camera_stream_to_socket(sock, cap, jpeg_quality, overlay_timestamp)
+        _picamera2_stream_to_socket(sock, width, height, jpeg_quality, overlay_timestamp)
     except BrokenPipeError:
         log.warning("TCP: соединение разорвано приёмником")
+    except ImportError:
+        log.error(
+            "Установите: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2"
+        )
     finally:
-        cap.release()
         sock.close()
-        log.info("send: камера и сокет закрыты")
+        log.info("send: завершено")
 
 
 def _make_mjpeg_handler(boundary_token: str) -> type[BaseHTTPRequestHandler]:
@@ -541,14 +765,28 @@ def _make_mjpeg_handler(boundary_token: str) -> type[BaseHTTPRequestHandler]:
             log.info('HTTP %s "%s"', self.address_string(), msg.strip())
 
         def do_GET(self) -> None:
-            if self.path in ("/", "/index.html"):
+            path = urlparse(self.path).path
+
+            if path in ("/", "/index.html"):
+                # MJPEG multipart в <img src="/stream"> часто даёт чёрный экран в Edge/Chrome;
+                # опрос /snapshot совместим со всеми браузерами.
                 html = (
                     "<!DOCTYPE html><html><head><meta charset=utf-8>"
+                    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
                     "<title>Камера</title><style>body{margin:0;background:#111;"
                     "display:flex;justify-content:center;align-items:center;"
                     "min-height:100vh}</style></head><body>"
-                    '<img src="/stream" alt="поток" style="max-width:100%;height:auto" />'
-                    "</body></html>"
+                    '<img id="cam" alt="камера" style="max-width:100%;height:auto;min-height:240px;'
+                    'background:#222;object-fit:contain" />'
+                    "<script>"
+                    "var el=document.getElementById('cam');"
+                    "function u(){el.src='/snapshot?t='+Date.now();}"
+                    "setInterval(u,66);u();"
+                    "</script>"
+                    "<p style=color:#888;font:12px sans-serif;text-align:center>"
+                    "Если пусто: откройте /snapshot в новой вкладке. "
+                    "Поток MJPEG: <a href=\"/stream\" style=color:#8cf>/stream</a> (лучше в Firefox)."
+                    "</p></body></html>"
                 )
                 data = html.encode("utf-8")
                 self.send_response(200)
@@ -558,7 +796,24 @@ def _make_mjpeg_handler(boundary_token: str) -> type[BaseHTTPRequestHandler]:
                 self.wfile.write(data)
                 return
 
-            if self.path != "/stream":
+            if path == "/snapshot":
+                with _frame_lock:
+                    jpeg = _latest_jpeg
+                if jpeg is None:
+                    self.send_response(503)
+                    self.send_header("Content-Type", "text/plain; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(b"no frame yet")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Content-Length", str(len(jpeg)))
+                self.end_headers()
+                self.wfile.write(jpeg)
+                return
+
+            if path != "/stream":
                 self.send_error(404)
                 return
 
@@ -851,6 +1106,29 @@ def main() -> None:
         action="store_true",
         help="Рисовать дату и время на каждом кадре (на стороне камеры, до сжатия JPEG)",
     )
+    p_send.add_argument(
+        "--camera-device",
+        default=None,
+        metavar="PATH",
+        help="Явный путь V4L2, напр. /dev/video0",
+    )
+    p_send.add_argument(
+        "--capture-backend",
+        choices=["auto", "v4l2", "default"],
+        default="auto",
+        help="Способ открытия камеры в OpenCV (auto перебирает варианты)",
+    )
+    p_send.add_argument(
+        "--no-set-fps",
+        action="store_true",
+        help="Не задавать CAP_PROP_FPS (на libcamera иногда мешает)",
+    )
+    p_send.add_argument(
+        "--capture",
+        choices=["auto", "opencv", "picamera2"],
+        default="auto",
+        help="Захват: auto — OpenCV, при неудаче picamera2; на Pi 5 с CSI часто нужен picamera2",
+    )
 
     p_recv = sub.add_parser("receive", help="Приёмник")
     p_recv.add_argument("--port", type=int, default=5000, help="TCP-порт для подключения камеры")
@@ -943,6 +1221,10 @@ def main() -> None:
             listen_disc,
             None,
             args.timestamp,
+            args.camera_device,
+            args.capture_backend,
+            not args.no_set_fps,
+            args.capture,
         )
         return
 
