@@ -17,6 +17,14 @@
   python stream_camera.py romeo
   python stream_camera.py flash-romeo
   python stream_camera.py wifi-scan
+  python stream_camera.py wifi-connect "ИмяСети" --password-file ~/wifi.key
+  # или: export RPI_WIFI_PASSWORD='...' && python stream_camera.py wifi-connect "ИмяСети"
+
+Сохранённые настройки в проекте (файл в .gitignore, шаблон в репозитории):
+  cp config/wifi.local.env.example config/wifi.local.env
+  # отредактируйте wifi.local.env, пароль лучше в отдельном файле с chmod 600
+  python stream_camera.py wifi-apply
+  ./scripts/wifi_apply.sh
 
 То же через модуль: ``python -m rpi_tools.cli ...``
 """

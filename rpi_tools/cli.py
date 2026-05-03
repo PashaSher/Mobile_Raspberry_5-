@@ -11,6 +11,7 @@ from rpi_tools.camera_stream import _default_capture_mode, run_send
 from rpi_tools.config import DISCOVERY_PORT_DEFAULT, ROMEO_USB_PORT
 from rpi_tools.logutil import setup_logging
 from rpi_tools.romeo_usb import run_flash_romeo, run_serial_send
+from rpi_tools.wifi_connect import run_wifi_apply_from_file, run_wifi_connect
 from rpi_tools.wifi_scan import run_wifi_scan
 
 log = logging.getLogger("camstream")
@@ -127,6 +128,45 @@ def main() -> None:
 
     sub.add_parser("wifi-scan", help="Показать доступные Wi‑Fi сети (nmcli)")
 
+    p_wc = sub.add_parser(
+        "wifi-connect",
+        help="Подключиться к Wi‑Fi и сохранить профиль (автоподключение после перезагрузки)",
+    )
+    p_wc.add_argument("ssid", help="Имя сети (SSID)")
+    p_wc.add_argument(
+        "--password",
+        default=None,
+        help="Пароль (в ps виден; лучше RPI_WIFI_PASSWORD или --password-file)",
+    )
+    p_wc.add_argument(
+        "--password-file",
+        default=None,
+        metavar="PATH",
+        help="Файл с одной строкой — пароль (права chmod 600)",
+    )
+    p_wc.add_argument(
+        "--ifname",
+        default=None,
+        metavar="DEV",
+        help="Интерфейс Wi‑Fi, напр. wlan0 (по умолчанию — первый wifi в nmcli)",
+    )
+    p_wc.add_argument(
+        "--hidden",
+        action="store_true",
+        help="Скрытая сеть (SSID не в эфирных маяках)",
+    )
+
+    p_wa = sub.add_parser(
+        "wifi-apply",
+        help="Подключить Wi‑Fi из config/wifi.local.env (секреты не в git; см. wifi.local.env.example)",
+    )
+    p_wa.add_argument(
+        "--env-file",
+        default=None,
+        metavar="PATH",
+        help="Файл настроек (по умолчанию config/wifi.local.env в корне проекта)",
+    )
+
     p_flash = sub.add_parser(
         "flash-romeo",
         help="Прошить Romeo/Leonardo (ATmega32U4) по USB — см. rpi_tools/romeo_usb.py и scripts/",
@@ -196,6 +236,20 @@ def main() -> None:
 
     if args.cmd == "wifi-scan":
         run_wifi_scan()
+        return
+
+    if args.cmd == "wifi-connect":
+        run_wifi_connect(
+            args.ssid,
+            args.password,
+            args.password_file,
+            args.ifname,
+            args.hidden,
+        )
+        return
+
+    if args.cmd == "wifi-apply":
+        run_wifi_apply_from_file(args.env_file)
         return
 
     if args.cmd == "flash-romeo":
