@@ -265,6 +265,28 @@ def run_wifi_connect(
         )
 
 
+def ap_password_resolve(explicit: str | None, env_file: str | None = None) -> str | None:
+    """
+    Пароль точки доступа: аргумент CLI > RPI_AP_PASSWORD > config/ap.local.env (ключ AP_PASSWORD).
+    Возвращает None, если нигде не задано — тогда hotspot подставит запасной пароль 12345678.
+    """
+    if explicit:
+        s = explicit.strip()
+        return s or None
+    env_var = (os.environ.get("RPI_AP_PASSWORD") or "").strip()
+    if env_var:
+        return env_var
+    from rpi_tools.config import PROJECT_ROOT
+
+    path = env_file or os.path.join(PROJECT_ROOT, "config", "ap.local.env")
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        return None
+    data = _parse_simple_env(path)
+    p = (data.get("AP_PASSWORD") or "").strip()
+    return p or None
+
+
 def _parse_simple_env(path: str) -> dict[str, str]:
     """Строки KEY=VALUE (без bash); комментарии от # до конца строки. Значение может содержать =."""
     out: dict[str, str] = {}
@@ -311,3 +333,161 @@ def run_wifi_apply_from_file(env_path: str | None = None) -> None:
     hidden = (data.get("WIFI_HIDDEN", "").strip().lower() in ("1", "true", "yes", "on"))
     log.info("wifi-apply: конфиг %s", path)
     run_wifi_connect(ssid, pwd, pwfile, ifname, hidden)
+
+
+def _nm_connection_exists(name: str) -> bool:
+    r = subprocess.run(
+        ["nmcli", "-t", "-f", "NAME", "connection", "show"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    if r.returncode != 0:
+        return False
+    names = {line.strip() for line in r.stdout.splitlines() if line.strip()}
+    return name in names
+
+
+def _ethernet_uplink_connected(device: str = "eth0") -> bool:
+    """Проверяет, есть ли рабочий ethernet uplink для сохранения SSH/интернета."""
+    r = subprocess.run(
+        ["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device", "status"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        parts = line.strip().split(":")
+        if len(parts) != 3:
+            continue
+        dev, typ, state = parts
+        if dev == device and typ == "ethernet" and state.startswith("connected"):
+            return True
+    return False
+
+
+def _log_ap_ssh_hint(ssid: str, ifname: str | None) -> None:
+    """После подъёма AP старый SSH по домашнему Wi‑Fi обычно недоступен — подсказка по новому адресу."""
+    dev = _wifi_device(ifname)
+    gw = "10.42.0.1"
+    try:
+        r = subprocess.run(
+            ["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                addr = line.strip().split("/")[0]
+                if addr.startswith("10.42."):
+                    gw = addr
+                    break
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    u = os.environ.get("USER", "pi")
+    log.info(
+        "AP «%s» на %s: если SSH шёл через домашний Wi‑Fi, сессия оборвётся — один радиоканал перешёл в режим точки. "
+        "Подключите ПК к этой AP, затем: ssh %s@%s (часто это 10.42.0.1 у NetworkManager shared).",
+        ssid,
+        dev,
+        u,
+        gw,
+    )
+
+
+def _hotspot_up(
+    *,
+    ssid: str,
+    password: str | None,
+    ifname: str | None,
+    sudo: bool,
+) -> tuple[bool, str]:
+    dev = _wifi_device(ifname)
+    # Надёжный сценарий AP: прямой hotspot-командой, без переиспользования старого профиля.
+    # Это избегает ошибок вида "wep-key0 required".
+    psk = password
+    if not psk:
+        psk = "12345678"
+    if len(psk) < 8:
+        return (
+            False,
+            f"Пароль точки доступа — {len(psk)} симв., для WPA2 нужно ≥8. "
+            "Проверьте --ap-password, RPI_AP_PASSWORD или AP_PASSWORD в config/ap.local.env.",
+        )
+
+    cmd = ["nmcli", "device", "wifi", "hotspot", "ssid", ssid, "password", psk]
+    if ifname:
+        cmd += ["ifname", ifname]
+    log.info(
+        "nmcli hotspot на %s (sudo=%s), ожидание до ~90 с — пока тихо в логе, это нормально …",
+        dev,
+        sudo,
+    )
+    r = _nm_run(cmd, sudo=sudo, timeout=90)
+    if r.returncode != 0:
+        return False, (r.stderr or r.stdout or "").strip()
+
+    return True, (r.stdout or "").strip() or f"Hotspot {ssid} поднят на {dev}"
+
+
+def run_wifi_hotspot(
+    ssid: str,
+    password: str | None,
+    ifname: str | None,
+    *,
+    require_ethernet_uplink: bool = False,
+) -> int:
+    """
+    Поднимает точку доступа Wi‑Fi через NetworkManager.
+
+    Коды возврата: 0 — ок; 2 — заблокировано (нет eth0 при require_ethernet_uplink); 1 — иная ошибка.
+    """
+    net = (ssid or "").strip()
+    if not net:
+        log.error("SSID точки доступа пустой.")
+        return 1
+    if require_ethernet_uplink and not _ethernet_uplink_connected("eth0"):
+        log.error(
+            "ETH uplink не активен (eth0 disconnected). Поднятие AP на wlan0 разорвёт текущий Wi‑Fi/SSH. "
+            "Подключите ethernet или запустите с принудительным флагом (--ap-force / wifi-hotspot --force)."
+        )
+        return 2
+    if not password:
+        log.warning(
+            "Пароль AP не задан (ни --ap-password, ни RPI_AP_PASSWORD, ни config/ap.local.env) — "
+            "используем запасной WPA2 пароль: 12345678"
+        )
+    log.info("wifi-hotspot: поднимаем точку доступа «%s» ...", net)
+
+    def _finish_ok(hmsg: str) -> int:
+        if hmsg:
+            log.info("%s", hmsg)
+        _log_ap_ssh_hint(net, ifname)
+        return 0
+
+    log.info("wifi-hotspot: nmcli без sudo (если отказ по правам — будет второй вызов с sudo) …")
+    ok, msg = _hotspot_up(ssid=net, password=password, ifname=ifname, sudo=False)
+    if ok:
+        return _finish_ok(msg)
+
+    mlow = msg.lower()
+    perm = (
+        "not authorized" in mlow
+        or "permission" in mlow
+        or "insufficient privileges" in mlow
+        or "requires privileges" in mlow
+        or "access denied" in mlow
+    )
+    if perm:
+        log.info("NetworkManager требует root — повтор с sudo …")
+        ok2, msg2 = _hotspot_up(ssid=net, password=password, ifname=ifname, sudo=True)
+        if ok2:
+            return _finish_ok(msg2)
+        log.error("Не удалось поднять hotspot: %s", msg2 or "nmcli error")
+        return 1
+
+    log.error("Не удалось поднять hotspot: %s", msg or "nmcli error")
+    return 1

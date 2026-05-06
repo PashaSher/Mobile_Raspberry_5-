@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import gc
 import logging
 import os
@@ -15,6 +16,11 @@ from rpi_tools.config import _STREAM_SNDBUF
 from rpi_tools.discovery import _start_discovery_responder, discover_receivers
 
 log = logging.getLogger("camstream")
+
+
+class TcpBindError(Exception):
+    """Не удалось занять TCP-порт (часто порт уже слушает другой процесс)."""
+
 
 def _tune_stream_socket(sock: socket.socket) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -358,7 +364,17 @@ def run_send_listen(
         tcp_srv.bind(("0.0.0.0", tcp_port))
     except OSError as e:
         log.error("TCP: не удалось bind 0.0.0.0:%s: %s", tcp_port, e)
-        sys.exit(1)
+        en = getattr(e, "errno", None)
+        if en == errno.EADDRINUSE or "Address already in use" in str(e):
+            log.error(
+                "Порт %s занят (часто предыдущий запуск не закрыт). Проверка: fuser -v %s/tcp "
+                "или ss -tlnp '( sport = :%s )'; остановка: kill <pid> или sudo fuser -k %s/tcp",
+                tcp_port,
+                tcp_port,
+                tcp_port,
+                tcp_port,
+            )
+        raise TcpBindError from e
     tcp_srv.listen(5)
     log.info("TCP: слушаем 0.0.0.0:%s, ждём клиента (Ctrl+C — выход)", tcp_port)
 

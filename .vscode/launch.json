@@ -1,0 +1,89 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "RPI: send + AP 12345 (по умолчанию, --ap-force)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stream_camera.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "send",
+        "--ap-ssid",
+        "12345",
+        "--ap-force",
+        "--listen",
+        "--port",
+        "5000"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "RPI: send + AP 12345 (только при подключённом eth0)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stream_camera.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "send",
+        "--ap-ssid",
+        "12345",
+        "--listen",
+        "--port",
+        "5000"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "RPI: send + AP 12345 + timestamp (--ap-force)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stream_camera.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "send",
+        "--ap-ssid",
+        "12345",
+        "--ap-force",
+        "--listen",
+        "--port",
+        "5000",
+        "--timestamp"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "RPI: send + AP 12345 + timestamp (только при eth0)",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stream_camera.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "send",
+        "--ap-ssid",
+        "12345",
+        "--listen",
+        "--port",
+        "5000",
+        "--timestamp"
+      ],
+      "justMyCode": true
+    },
+    {
+      "name": "RPI: wifi-scan",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stream_camera.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "args": [
+        "wifi-scan"
+      ],
+      "justMyCode": true
+    }
+  ]
+}

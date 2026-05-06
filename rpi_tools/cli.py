@@ -7,17 +7,32 @@ import logging
 import os
 import sys
 
-from rpi_tools.camera_stream import _default_capture_mode, run_send
+from rpi_tools.camera_stream import TcpBindError, _default_capture_mode, run_send
 from rpi_tools.config import DISCOVERY_PORT_DEFAULT, ROMEO_USB_PORT
 from rpi_tools.logutil import setup_logging
 from rpi_tools.romeo_usb import run_flash_romeo, run_serial_send
-from rpi_tools.wifi_connect import run_wifi_apply_from_file, run_wifi_connect
+from rpi_tools.wifi_connect import (
+    ap_password_resolve,
+    run_wifi_apply_from_file,
+    run_wifi_connect,
+    run_wifi_hotspot,
+)
 from rpi_tools.wifi_scan import run_wifi_scan
 
 log = logging.getLogger("camstream")
 
 
-def main() -> None:
+def _print_hotspot_blocked_hint() -> None:
+    print(
+        "camstream: выход с кодом 2 — это не падение. "
+        "AP не поднят: нет активного Ethernet (eth0). "
+        "Подключите кабель, либо добавьте --ap-force (или wifi-hotspot --force), "
+        "либо в Run and Debug выберите конфигурацию с --ap-force.",
+        file=sys.stderr,
+    )
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Raspberry Pi: камера (TCP MJPEG + UDP discovery), Romeo USB, Wi‑Fi, прошивка"
     )
@@ -125,6 +140,29 @@ def main() -> None:
         default=_default_capture_mode(),
         help="Захват: на Raspberry Pi по умолчанию picamera2; auto — OpenCV, при неудаче picamera2; opencv — только OpenCV",
     )
+    p_send.add_argument(
+        "--ap-ssid",
+        default=None,
+        metavar="SSID",
+        help="Перед запуском send поднять на Pi Wi‑Fi точку доступа с этим SSID (например, 12345)",
+    )
+    p_send.add_argument(
+        "--ap-password",
+        default=None,
+        metavar="PASS",
+        help="Пароль точки доступа WPA2; иначе RPI_AP_PASSWORD или config/ap.local.env (AP_PASSWORD); иначе 12345678",
+    )
+    p_send.add_argument(
+        "--ap-ifname",
+        default=None,
+        metavar="DEV",
+        help="Интерфейс для точки доступа, напр. wlan0 (по умолчанию авто)",
+    )
+    p_send.add_argument(
+        "--ap-force",
+        action="store_true",
+        help="Принудительно поднять AP даже без ethernet uplink (может разорвать SSH по Wi‑Fi)",
+    )
 
     sub.add_parser("wifi-scan", help="Показать доступные Wi‑Fi сети (nmcli)")
 
@@ -165,6 +203,22 @@ def main() -> None:
         default=None,
         metavar="PATH",
         help="Файл настроек (по умолчанию config/wifi.local.env в корне проекта)",
+    )
+    p_ap = sub.add_parser(
+        "wifi-hotspot",
+        help="Поднять собственную Wi‑Fi сеть (точка доступа) для подключения ПК",
+    )
+    p_ap.add_argument("ssid", nargs="?", default="12345", help="Имя сети (по умолчанию 12345)")
+    p_ap.add_argument(
+        "--password",
+        default=None,
+        help="Пароль WPA2 (>=8); иначе RPI_AP_PASSWORD или config/ap.local.env; иначе запасной 12345678",
+    )
+    p_ap.add_argument("--ifname", default=None, metavar="DEV", help="Интерфейс Wi‑Fi, напр. wlan0")
+    p_ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Принудительно поднять AP без проверки ethernet uplink (может разорвать SSH по Wi‑Fi)",
     )
 
     p_flash = sub.add_parser(
@@ -236,7 +290,7 @@ def main() -> None:
 
     if args.cmd == "wifi-scan":
         run_wifi_scan()
-        return
+        return 0
 
     if args.cmd == "wifi-connect":
         run_wifi_connect(
@@ -246,15 +300,26 @@ def main() -> None:
             args.ifname,
             args.hidden,
         )
-        return
+        return 0
 
     if args.cmd == "wifi-apply":
         run_wifi_apply_from_file(args.env_file)
-        return
+        return 0
+
+    if args.cmd == "wifi-hotspot":
+        ap_rc = run_wifi_hotspot(
+            args.ssid,
+            ap_password_resolve(args.password),
+            args.ifname,
+            require_ethernet_uplink=not args.force,
+        )
+        if ap_rc == 2:
+            _print_hotspot_blocked_hint()
+        return ap_rc
 
     if args.cmd == "flash-romeo":
         run_flash_romeo(args.hex)
-        return
+        return 0
 
     if args.cmd in ("serial-send", "romeo"):
         append_lf = not args.no_nl
@@ -267,9 +332,20 @@ def main() -> None:
             args.read_idle,
             args.open_delay,
         )
-        return
+        return 0
 
     if args.cmd == "send":
+        if args.ap_ssid:
+            ap_rc = run_wifi_hotspot(
+                args.ap_ssid,
+                ap_password_resolve(args.ap_password),
+                args.ap_ifname,
+                require_ethernet_uplink=not args.ap_force,
+            )
+            if ap_rc == 2:
+                _print_hotspot_blocked_hint()
+            if ap_rc != 0:
+                return ap_rc
         if args.listen and args.host.strip().lower() not in ("auto", "discover"):
             print(
                 "При --listen параметр --host не используется (клиенты подключаются к этому Pi).",
@@ -279,31 +355,36 @@ def main() -> None:
             listen_disc = None if args.no_discovery or args.discover_port == 0 else args.discover_port
         else:
             listen_disc = None
-        run_send(
-            args.host,
-            args.port,
-            args.camera,
-            args.width,
-            args.height,
-            args.fps,
-            args.jpeg_quality,
-            args.discover_port,
-            args.discover_token,
-            args.discover_timeout,
-            args.discover_index,
-            args.discover_loop,
-            args.discover_loop_interval,
-            args.listen,
-            listen_disc,
-            None,
-            args.timestamp,
-            args.camera_device,
-            args.capture_backend,
-            not args.no_set_fps,
-            args.capture,
-        )
-        return
+        try:
+            run_send(
+                args.host,
+                args.port,
+                args.camera,
+                args.width,
+                args.height,
+                args.fps,
+                args.jpeg_quality,
+                args.discover_port,
+                args.discover_token,
+                args.discover_timeout,
+                args.discover_index,
+                args.discover_loop,
+                args.discover_loop_interval,
+                args.listen,
+                listen_disc,
+                None,
+                args.timestamp,
+                args.camera_device,
+                args.capture_backend,
+                not args.no_set_fps,
+                args.capture,
+            )
+        except TcpBindError:
+            return 3
+        return 0
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

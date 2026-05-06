@@ -37,4 +37,4 @@ from rpi_tools.config import ROMEO_USB_PORT
 __all__ = ["main", "ROMEO_USB_PORT"]
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
