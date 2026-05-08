@@ -69,10 +69,20 @@ def main() -> int:
         help="TCP-порт приёмника (если не auto; при auto берётся из ответа discovery)",
     )
     p_send.add_argument("--camera", type=int, default=0, help="Индекс камеры (0 по умолчанию)")
-    p_send.add_argument("--width", type=int, default=640)
-    p_send.add_argument("--height", type=int, default=480)
-    p_send.add_argument("--fps", type=float, default=25.0)
-    p_send.add_argument("--jpeg-quality", type=int, default=80, help="1–100")
+    p_send.add_argument("--width", type=int, default=640, help="Ширина кадра (меньше разрешение — обычно стабильнее FPS и меньше «мазни» при узком Wi‑Fi)")
+    p_send.add_argument("--height", type=int, default=480, help="Высота кадра")
+    p_send.add_argument(
+        "--fps",
+        type=float,
+        default=25.0,
+        help="Запрошенный FPS (если камера и бэкенд реально выдают)",
+    )
+    p_send.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=88,
+        help="Качество JPEG 1–100 (выше — меньше артефактов «мыла», больше трафика; см. docs/pi-stream-quality.ru.md)",
+    )
     p_send.add_argument(
         "--discover-port",
         type=int,
@@ -120,7 +130,7 @@ def main() -> int:
     p_send.add_argument(
         "--timestamp",
         action="store_true",
-        help="Рисовать дату и время на каждом кадре (на стороне камеры, до сжатия JPEG)",
+        help="Рисовать дату и время на каждом кадре (на стороне камеры, до JPEG); добавляет мелкий шум в сжатии",
     )
     p_send.add_argument(
         "--camera-device",
@@ -206,6 +216,18 @@ def main() -> int:
         help=(
             "Резерв CLI (раньше — модуль скорости для старого дифференциала). Вбок теперь TL/TR в прошивке; "
             "отдельные скорости гусениц — JSON {\"action\":\"tank\",\"left\":n,\"right\":n} или строка «TANK l r»."
+        ),
+    )
+
+    p_send.add_argument(
+        "--romeo-turret-step",
+        type=int,
+        default=None,
+        metavar="DEG",
+        dest="romeo_turret_step",
+        help=(
+            "Если задано: для JSON «action\":\"turret» без поля «step» подставлять шаг в градусах "
+            "(на Romeo уходит PANL 2 вместо голого PANL — мельче шаг при удержании клавиши на ПК)."
         ),
     )
 
@@ -428,6 +450,7 @@ def main() -> int:
                 romeo_baud=args.romeo_baud,
                 romeo_open_delay=args.romeo_open_delay,
                 romeo_tank_speed=args.romeo_tank_speed,
+                romeo_turret_step=args.romeo_turret_step,
             )
         except TcpBindError:
             return 3

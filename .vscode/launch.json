@@ -15,7 +15,9 @@
         "--ap-force",
         "--listen",
         "--port",
-        "5000"
+        "5000",
+        "--romeo-turret-step",
+        "2"
       ],
       "justMyCode": true
     },
@@ -32,7 +34,9 @@
         "12345",
         "--listen",
         "--port",
-        "5000"
+        "5000",
+        "--romeo-turret-step",
+        "2"
       ],
       "justMyCode": true
     },
@@ -51,6 +55,8 @@
         "--listen",
         "--port",
         "5000",
+        "--romeo-turret-step",
+        "2",
         "--timestamp"
       ],
       "justMyCode": true
@@ -69,6 +75,8 @@
         "--listen",
         "--port",
         "5000",
+        "--romeo-turret-step",
+        "2",
         "--timestamp"
       ],
       "justMyCode": true

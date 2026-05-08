@@ -344,6 +344,7 @@ def run_send_listen(
     romeo_baud: int = 115200,
     romeo_open_delay: float = 0.0,
     romeo_tank_speed: int = 200,
+    romeo_turret_step: int | float | None = None,
 ) -> None:
     """
     Пассивный режим для автозапуска на Pi: UDP discovery + ожидание TCP,
@@ -379,6 +380,7 @@ def run_send_listen(
             baud=romeo_baud,
             open_delay=romeo_open_delay,
             tank_speed=romeo_tank_speed,
+            turret_step_default=romeo_turret_step,
         )
 
     tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -484,6 +486,7 @@ def run_send(
     romeo_baud: int = 115200,
     romeo_open_delay: float = 0.0,
     romeo_tank_speed: int = 200,
+    romeo_turret_step: int | float | None = None,
 ) -> None:
     if listen:
         run_send_listen(
@@ -506,6 +509,7 @@ def run_send(
             romeo_baud=romeo_baud,
             romeo_open_delay=romeo_open_delay,
             romeo_tank_speed=romeo_tank_speed,
+            romeo_turret_step=romeo_turret_step,
         )
         return
 
