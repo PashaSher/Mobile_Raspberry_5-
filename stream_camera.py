@@ -11,6 +11,8 @@
 - ``rpi_tools/discovery.py`` — протокол UDP handshake.
 - ``rpi_tools/config.py`` — ``ROMEO_USB_PORT``, пути к ``scripts/``, константы discovery.
 
+- ``rpi_tools/boot_gpio_gate.py`` — при старте Pi: если GPIO (BCM) на земле → ``exec`` стрима, иначе выход без запуска (см. ``scripts/camstream-gpio-gate.service.example``).
+
 Документация: клиент на ПК — ``docs/pc-remote-control.ru.md``; качество видео на Pi (JPEG, разрешение) — ``docs/pi-stream-quality.ru.md``.
 
 Примеры:

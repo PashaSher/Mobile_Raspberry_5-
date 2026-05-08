@@ -2,3 +2,4 @@
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 # CSI / libcamera: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2
+# Автозапуск по GPIO (pull-up): pip install gpiozero или apt install python3-gpiozero
