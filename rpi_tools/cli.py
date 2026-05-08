@@ -8,7 +8,12 @@ import os
 import sys
 
 from rpi_tools.camera_stream import TcpBindError, _default_capture_mode, run_send
-from rpi_tools.config import DISCOVERY_PORT_DEFAULT, ROMEO_USB_PORT
+from rpi_tools.config import (
+    DISCOVERY_PORT_DEFAULT,
+    ROMEO_CONTROL_PORT_DEFAULT,
+    ROMEO_TANK_SPEED_DEFAULT,
+    ROMEO_USB_PORT,
+)
 from rpi_tools.logutil import setup_logging
 from rpi_tools.romeo_usb import run_flash_romeo, run_serial_send
 from rpi_tools.wifi_connect import (
@@ -162,6 +167,46 @@ def main() -> int:
         "--ap-force",
         action="store_true",
         help="Принудительно поднять AP даже без ethernet uplink (может разорвать SSH по Wi‑Fi)",
+    )
+    p_send.add_argument(
+        "--romeo-control-port",
+        type=int,
+        default=ROMEO_CONTROL_PORT_DEFAULT,
+        metavar="PORT",
+        help=(
+            "При --listen: TCP-порт приёма команд Romeo с ПК по Wi‑Fi/LAN (по умолчанию %s; 0 — выключить). "
+            "В ответ UDP discovery добавляется поле «control» с этим портом."
+            % (ROMEO_CONTROL_PORT_DEFAULT,)
+        ),
+    )
+    p_send.add_argument(
+        "--romeo-usb",
+        default=None,
+        metavar="DEV",
+        help=f"USB CDC Romeo для сервера управления (по умолчанию {ROMEO_USB_PORT} из rpi_tools/config.py)",
+    )
+    p_send.add_argument(
+        "--romeo-baud",
+        type=int,
+        default=115200,
+        help="Скорость UART Romeo для TCP→USB",
+    )
+    p_send.add_argument(
+        "--romeo-open-delay",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Пауза только при первом открытии USB в TCP-сессии управления (если скетч перезагружается при connect)",
+    )
+    p_send.add_argument(
+        "--romeo-tank-speed",
+        type=int,
+        default=ROMEO_TANK_SPEED_DEFAULT,
+        metavar="N",
+        help=(
+            "Резерв CLI (раньше — модуль скорости для старого дифференциала). Вбок теперь TL/TR в прошивке; "
+            "отдельные скорости гусениц — JSON {\"action\":\"tank\",\"left\":n,\"right\":n} или строка «TANK l r»."
+        ),
     )
 
     sub.add_parser("wifi-scan", help="Показать доступные Wi‑Fi сети (nmcli)")
@@ -378,6 +423,11 @@ def main() -> int:
                 args.capture_backend,
                 not args.no_set_fps,
                 args.capture,
+                romeo_control_port=args.romeo_control_port,
+                romeo_usb_port=args.romeo_usb,
+                romeo_baud=args.romeo_baud,
+                romeo_open_delay=args.romeo_open_delay,
+                romeo_tank_speed=args.romeo_tank_speed,
             )
         except TcpBindError:
             return 3

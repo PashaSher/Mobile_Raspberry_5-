@@ -6,11 +6,15 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 import time
 
 from rpi_tools.config import FLASH_ROMEO_AUTO_SH, ROMEO_USB_PORT
 
 log = logging.getLogger("camstream")
+
+# Один USB CDC — один писатель (стрим + CLI + TCP не должны мешать друг другу).
+_ROMEO_IO_LOCK = threading.Lock()
 
 
 def run_flash_romeo(hex_path: str) -> None:
@@ -49,6 +53,45 @@ def _serial_read_until_idle(ser, read_timeout: float, read_idle: float) -> bytes
     return bytes(buf)
 
 
+def romeo_exchange(
+    port: str,
+    baud: int,
+    text: str,
+    *,
+    append_lf: bool = True,
+    read_timeout: float = 3.0,
+    read_idle: float = 0.25,
+    open_delay: float = 0.0,
+    log_send: bool = True,
+) -> bytes:
+    """
+    Отправка одной строки UTF-8 на Romeo и чтение ответа (до таймаута).
+    Потокобезопасно относительно других вызовов romeo_exchange/run_serial_send.
+    """
+    try:
+        import serial
+    except ImportError:
+        raise RuntimeError("Нужен pyserial: pip install pyserial (или apt install python3-serial)") from None
+    dev = port
+    if not os.path.exists(dev):
+        raise OSError(f"USB-порт не найден: {dev}")
+    payload = text.encode("utf-8", errors="replace")
+    if append_lf:
+        payload += b"\n"
+    with _ROMEO_IO_LOCK:
+        with serial.Serial(dev, baud, timeout=0.1, dsrdtr=False, rtscts=False) as ser:
+            if open_delay > 0:
+                if log_send:
+                    log.info("serial-send: пауза %.1f с после открытия порта (загрузка скетча)", open_delay)
+                time.sleep(open_delay)
+            ser.reset_input_buffer()
+            ser.write(payload)
+            ser.flush()
+            if log_send:
+                log.info("serial-send: отправлено %d байт на %s @ %s", len(payload), dev, baud)
+            return _serial_read_until_idle(ser, read_timeout, read_idle)
+
+
 def run_serial_send(
     port: str,
     baud: int,
@@ -59,34 +102,29 @@ def run_serial_send(
     open_delay: float,
 ) -> None:
     """Отправка UTF-8 на USB CDC и чтение ответа."""
-    try:
-        import serial
-    except ImportError:
-        log.error("Нужен pyserial: pip install pyserial (или apt install python3-serial)")
-        sys.exit(1)
-    dev = port
-    if not os.path.exists(dev):
+    if not os.path.exists(port):
         log.error(
             "USB-порт не найден: %s (задайте порт в rpi_tools/config.py, ROMEO_USB_PORT, или --port)",
-            dev,
+            port,
         )
         sys.exit(1)
-    log.info("serial-send: порт %s", dev)
-    payload = text.encode("utf-8", errors="replace")
-    if append_lf:
-        payload += b"\n"
+    log.info("serial-send: порт %s", port)
     try:
-        with serial.Serial(dev, baud, timeout=0.1, dsrdtr=False, rtscts=False) as ser:
-            if open_delay > 0:
-                log.info("serial-send: пауза %.1f с после открытия порта (загрузка скетча)", open_delay)
-                time.sleep(open_delay)
-            ser.reset_input_buffer()
-            ser.write(payload)
-            ser.flush()
-            log.info("serial-send: отправлено %d байт на %s @ %s", len(payload), dev, baud)
-            reply = _serial_read_until_idle(ser, read_timeout, read_idle)
+        reply = romeo_exchange(
+            port,
+            baud,
+            text,
+            append_lf=append_lf,
+            read_timeout=read_timeout,
+            read_idle=read_idle,
+            open_delay=open_delay,
+            log_send=True,
+        )
+    except RuntimeError as e:
+        log.error("%s", e)
+        sys.exit(1)
     except OSError as e:
-        log.error("Serial %s: %s (группа dialout? закройте монитор порта)", dev, e)
+        log.error("Serial %s: %s (группа dialout? закройте монитор порта)", port, e)
         sys.exit(1)
     if reply:
         dec = reply.decode("utf-8", errors="replace")

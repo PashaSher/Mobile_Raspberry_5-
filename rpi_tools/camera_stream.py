@@ -12,8 +12,9 @@ import sys
 import threading
 import time
 
-from rpi_tools.config import _STREAM_SNDBUF
+from rpi_tools.config import ROMEO_USB_PORT, _STREAM_SNDBUF
 from rpi_tools.discovery import _start_discovery_responder, discover_receivers
+from rpi_tools.romeo_control_server import start_romeo_control_server
 
 log = logging.getLogger("camstream")
 
@@ -338,14 +339,26 @@ def run_send_listen(
     capture_backend: str,
     set_fps: bool,
     capture_mode: str,
+    romeo_control_port: int = 0,
+    romeo_usb_port: str | None = None,
+    romeo_baud: int = 115200,
+    romeo_open_delay: float = 0.0,
+    romeo_tank_speed: int = 200,
 ) -> None:
     """
     Пассивный режим для автозапуска на Pi: UDP discovery + ожидание TCP,
     после accept открывается камера и идёт тот же поток MJPEG.
     """
+    ctl_advertise = romeo_control_port if romeo_control_port > 0 else None
     if discover_port is not None:
         try:
-            _start_discovery_responder(discover_port, tcp_port, http_advertise, discover_token)
+            _start_discovery_responder(
+                discover_port,
+                tcp_port,
+                http_advertise,
+                discover_token,
+                control_tcp_port=ctl_advertise,
+            )
         except OSError:
             sys.exit(1)
         log.info(
@@ -357,6 +370,16 @@ def run_send_listen(
         log.info("режим listen: UDP discovery отключён (--no-discovery)")
 
     log.info("send: режим захвата=%s", capture_mode)
+
+    if romeo_control_port > 0:
+        usb = romeo_usb_port or ROMEO_USB_PORT
+        start_romeo_control_server(
+            romeo_control_port,
+            romeo_port=usb,
+            baud=romeo_baud,
+            open_delay=romeo_open_delay,
+            tank_speed=romeo_tank_speed,
+        )
 
     tcp_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -456,6 +479,11 @@ def run_send(
     capture_backend: str,
     set_fps: bool,
     capture_mode: str,
+    romeo_control_port: int = 0,
+    romeo_usb_port: str | None = None,
+    romeo_baud: int = 115200,
+    romeo_open_delay: float = 0.0,
+    romeo_tank_speed: int = 200,
 ) -> None:
     if listen:
         run_send_listen(
@@ -473,6 +501,11 @@ def run_send(
             capture_backend,
             set_fps,
             capture_mode,
+            romeo_control_port=romeo_control_port,
+            romeo_usb_port=romeo_usb_port,
+            romeo_baud=romeo_baud,
+            romeo_open_delay=romeo_open_delay,
+            romeo_tank_speed=romeo_tank_speed,
         )
         return
 
@@ -502,16 +535,19 @@ def run_send(
         if len(peers) > 1:
             log.info("Найдено несколько ответов discover (см. --discover-index):")
             for i, p in enumerate(peers):
-                ip_i, tcp_i, http_i, name_i = p
+                ip_i, tcp_i, http_i, name_i, ctl_i = p
                 extra = f" ({name_i})" if name_i else ""
                 http_s = f" http={http_i}" if http_i is not None else ""
-                log.info("  [%d] %s tcp=%s%s%s", i, ip_i, tcp_i, http_s, extra)
-        ip, tcp_p, http_p, name = peers[discover_index]
+                ctl_s = f" control={ctl_i}" if ctl_i is not None else ""
+                log.info("  [%d] %s tcp=%s%s%s%s", i, ip_i, tcp_i, http_s, ctl_s, extra)
+        ip, tcp_p, http_p, name, ctl_p = peers[discover_index]
         host = ip
         port = tcp_p
         log.info("Выбран хост #%d: %s:%s%s", discover_index, host, port, f" ({name})" if name else "")
         if http_p is not None:
             log.info("Просмотр в браузере: http://%s:%s/", host, http_p)
+        if ctl_p is not None:
+            log.info("Romeo control (TCP с ПК на Pi): %s:%s", host, ctl_p)
 
     log.info("send: режим захвата=%s", capture_mode)
 

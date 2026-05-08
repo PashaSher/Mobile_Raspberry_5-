@@ -43,10 +43,10 @@ def discover_receivers(
     token: str,
     timeout: float,
     wait_after_send: float = 0.15,
-) -> list[tuple[str, int, int | None, str | None]]:
+) -> list[tuple[str, int, int | None, str | None, int | None]]:
     """
     Шлёт UDP broadcast и собирает ответы на handshake (discover).
-    Возвращает список (ip, tcp_port, http_port|None, name).
+    Возвращает список (ip, tcp_port, http_port|None, name, control_tcp|None).
     """
     log.info("discovery: широковещательный запрос UDP → порт %s, таймаут %.1f с", discover_port, timeout)
     req = _discovery_request_payload(token)
@@ -64,8 +64,8 @@ def discover_receivers(
     time.sleep(wait_after_send)
 
     deadline = time.monotonic() + timeout
-    seen: set[tuple[str, int, int | None]] = set()
-    out: list[tuple[str, int, int | None, str | None]] = []
+    seen: set[tuple[str, int, int | None, int | None]] = set()
+    out: list[tuple[str, int, int | None, str | None, int | None]] = []
 
     while time.monotonic() < deadline:
         remaining = deadline - time.monotonic()
@@ -84,17 +84,21 @@ def discover_receivers(
         http_p = msg.get("http")
         if http_p is not None:
             http_p = int(http_p)
+        ctl_p = msg.get("control")
+        if ctl_p is not None:
+            ctl_p = int(ctl_p)
         name = msg.get("name")
-        key = (ip, tcp_p, http_p)
+        key = (ip, tcp_p, http_p, ctl_p)
         if key in seen:
             continue
         seen.add(key)
-        out.append((ip, tcp_p, http_p, name if isinstance(name, str) else None))
+        out.append((ip, tcp_p, http_p, name if isinstance(name, str) else None, ctl_p))
         log.info(
-            "discovery: ответ от %s tcp=%s http=%s name=%s",
+            "discovery: ответ от %s tcp=%s http=%s control=%s name=%s",
             ip,
             tcp_p,
             http_p,
+            ctl_p if ctl_p is not None else "—",
             name or "—",
         )
 
@@ -107,6 +111,7 @@ def _discovery_responder_loop(
     udp_sock: socket.socket,
     tcp_port: int,
     http_port: int | None,
+    control_tcp_port: int | None,
     token: str | None,
 ) -> None:
     while True:
@@ -131,6 +136,8 @@ def _discovery_responder_loop(
         }
         if http_port is not None:
             rsp["http"] = http_port
+        if control_tcp_port is not None and control_tcp_port > 0:
+            rsp["control"] = control_tcp_port
         try:
             udp_sock.sendto(json.dumps(rsp, separators=(",", ":")).encode("utf-8"), addr)
             log.debug("discovery: отправлен hello → %s tcp=%s", addr[0], tcp_port)
@@ -143,6 +150,7 @@ def _start_discovery_responder(
     tcp_port: int,
     http_port: int | None,
     token: str | None,
+    control_tcp_port: int | None = None,
 ) -> tuple[socket.socket, threading.Thread]:
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -154,7 +162,7 @@ def _start_discovery_responder(
     log.info("UDP discovery: слушаем 0.0.0.0:%s (ответы на handshake)", discover_port)
     th = threading.Thread(
         target=_discovery_responder_loop,
-        args=(udp, tcp_port, http_port, token),
+        args=(udp, tcp_port, http_port, control_tcp_port, token),
         daemon=True,
     )
     th.start()
