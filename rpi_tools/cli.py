@@ -7,7 +7,8 @@ import logging
 import os
 import sys
 
-from rpi_tools.camera_stream import TcpBindError, _default_capture_mode, run_send
+from rpi_tools.camera_stream import _default_capture_mode, run_send
+from rpi_tools.errors import TcpBindError
 from rpi_tools.config import (
     DISCOVERY_PORT_DEFAULT,
     ROMEO_CONTROL_PORT_DEFAULT,
@@ -230,6 +231,13 @@ def main() -> int:
             "(на Romeo уходит PANL 2 вместо голого PANL — мельче шаг при удержании клавиши на ПК)."
         ),
     )
+    p_send.add_argument(
+        "--romeo-led-interval",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="При --listen: раз в SEC с слать на Romeo по USB команду LTG (toggle бортового светодиода). 0 — выключить.",
+    )
 
     sub.add_parser("wifi-scan", help="Показать доступные Wi‑Fi сети (nmcli)")
 
@@ -451,6 +459,7 @@ def main() -> int:
                 romeo_open_delay=args.romeo_open_delay,
                 romeo_tank_speed=args.romeo_tank_speed,
                 romeo_turret_step=args.romeo_turret_step,
+                romeo_led_interval_sec=args.romeo_led_interval,
             )
         except TcpBindError:
             return 3

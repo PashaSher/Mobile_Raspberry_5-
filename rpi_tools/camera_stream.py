@@ -15,12 +15,10 @@ import time
 from rpi_tools.config import ROMEO_USB_PORT, _STREAM_SNDBUF
 from rpi_tools.discovery import _start_discovery_responder, discover_receivers
 from rpi_tools.romeo_control_server import start_romeo_control_server
+from rpi_tools.errors import TcpBindError
+from rpi_tools.romeo_usb import start_romeo_led_heartbeat
 
 log = logging.getLogger("camstream")
-
-
-class TcpBindError(Exception):
-    """Не удалось занять TCP-порт (часто порт уже слушает другой процесс)."""
 
 
 def _tune_stream_socket(sock: socket.socket) -> None:
@@ -345,6 +343,7 @@ def run_send_listen(
     romeo_open_delay: float = 0.0,
     romeo_tank_speed: int = 200,
     romeo_turret_step: int | float | None = None,
+    romeo_led_interval_sec: float = 5.0,
 ) -> None:
     """
     Пассивный режим для автозапуска на Pi: UDP discovery + ожидание TCP,
@@ -402,6 +401,15 @@ def run_send_listen(
         raise TcpBindError from e
     tcp_srv.listen(5)
     log.info("TCP: слушаем 0.0.0.0:%s, ждём клиента (Ctrl+C — выход)", tcp_port)
+
+    usb = romeo_usb_port or ROMEO_USB_PORT
+    if romeo_led_interval_sec > 0:
+        start_romeo_led_heartbeat(
+            port=usb,
+            baud=romeo_baud,
+            interval_sec=float(romeo_led_interval_sec),
+            open_delay=romeo_open_delay,
+        )
 
     while True:
         conn, addr = tcp_srv.accept()
@@ -487,6 +495,7 @@ def run_send(
     romeo_open_delay: float = 0.0,
     romeo_tank_speed: int = 200,
     romeo_turret_step: int | float | None = None,
+    romeo_led_interval_sec: float = 5.0,
 ) -> None:
     if listen:
         run_send_listen(
@@ -510,6 +519,7 @@ def run_send(
             romeo_open_delay=romeo_open_delay,
             romeo_tank_speed=romeo_tank_speed,
             romeo_turret_step=romeo_turret_step,
+            romeo_led_interval_sec=romeo_led_interval_sec,
         )
         return
 

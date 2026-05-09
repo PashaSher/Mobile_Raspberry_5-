@@ -19,7 +19,8 @@
         "--romeo-turret-step",
         "2"
       ],
-      "justMyCode": true
+      "justMyCode": true,
+      "preLaunchTask": "free-camstream-debug-ports"
     },
     {
       "name": "RPI: send + AP 12345 (только при подключённом eth0)",
@@ -38,7 +39,8 @@
         "--romeo-turret-step",
         "2"
       ],
-      "justMyCode": true
+      "justMyCode": true,
+      "preLaunchTask": "free-camstream-debug-ports"
     },
     {
       "name": "RPI: send + AP 12345 + timestamp (--ap-force)",
@@ -59,7 +61,8 @@
         "2",
         "--timestamp"
       ],
-      "justMyCode": true
+      "justMyCode": true,
+      "preLaunchTask": "free-camstream-debug-ports"
     },
     {
       "name": "RPI: send + AP 12345 + timestamp (только при eth0)",
@@ -79,7 +82,8 @@
         "2",
         "--timestamp"
       ],
-      "justMyCode": true
+      "justMyCode": true,
+      "preLaunchTask": "free-camstream-debug-ports"
     },
     {
       "name": "RPI: wifi-scan",

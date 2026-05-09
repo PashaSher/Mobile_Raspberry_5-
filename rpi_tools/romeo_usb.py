@@ -92,6 +92,61 @@ def romeo_exchange(
             return _serial_read_until_idle(ser, read_timeout, read_idle)
 
 
+def start_romeo_led_heartbeat(
+    *,
+    port: str | None,
+    baud: int,
+    interval_sec: float,
+    open_delay: float = 0.0,
+) -> tuple[threading.Thread | None, threading.Event | None]:
+    """
+    Запускает daemon-поток: раз в ``interval_sec`` сек отправляет строку LTG на Romeo (toggle бортового LED).
+    Совместимо с Romeo TCP→USB тем же блокировкой ``_ROMEO_IO_LOCK``.
+    """
+    device = port or ROMEO_USB_PORT
+    if interval_sec <= 0:
+        return None, None
+    stop = threading.Event()
+
+    def _worker() -> None:
+        log.info(
+            "Romeo heartbeat: LTG каждые %.1f с на %s @ %s (toggle LED по прошивке)",
+            interval_sec,
+            device,
+            baud,
+        )
+        od0 = float(open_delay) if open_delay > 0 else 0.0
+        use_open_delay = od0 > 0
+        while True:
+            if stop.wait(interval_sec):
+                break
+            try:
+                if not os.path.exists(device):
+                    log.debug("Romeo heartbeat: порт не найден: %s", device)
+                    continue
+                od_this = od0 if use_open_delay else 0.0
+                romeo_exchange(
+                    device,
+                    baud,
+                    "LTG",
+                    append_lf=True,
+                    read_timeout=0.35,
+                    read_idle=0.06,
+                    open_delay=od_this,
+                    log_send=False,
+                )
+                use_open_delay = False
+            except RuntimeError as e:
+                log.warning("Romeo heartbeat недоступен: %s", e)
+                break
+            except OSError as e:
+                log.debug("Romeo heartbeat LTG: %s", e)
+
+    th = threading.Thread(target=_worker, name="romeo-led-heartbeat", daemon=True)
+    th.start()
+    return th, stop
+
+
 def run_serial_send(
     port: str,
     baud: int,

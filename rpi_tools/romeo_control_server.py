@@ -46,6 +46,7 @@ import json
 import logging
 import socket
 import threading
+from rpi_tools.errors import TcpBindError
 from rpi_tools.romeo_usb import romeo_exchange
 
 log = logging.getLogger("camstream")
@@ -316,8 +317,24 @@ def start_romeo_control_server(
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", bind_port))
-    srv.listen(8)
+    try:
+        srv.bind(("0.0.0.0", bind_port))
+        srv.listen(8)
+    except OSError as e:
+        log.error("romeo-control: не удалось bind 0.0.0.0:%s: %s", bind_port, e)
+        en = getattr(e, "errno", None)
+        if en == errno.EADDRINUSE or "Address already in use" in str(e):
+            log.error(
+                "Порт %s занят — часто второй экземпляр camstream/stream_camera или systemd. "
+                "Проверка: ss -tlnp '( sport = :%s )'; временно без сервера: --romeo-control-port 0",
+                bind_port,
+                bind_port,
+            )
+        try:
+            srv.close()
+        except OSError:
+            pass
+        raise TcpBindError("romeo-control") from e
     if turret_step_default is not None:
         log.info(
             "romeo-control: по умолчанию шаг башни для action=turret без «step»: %s° (PANL/TILTU …)",

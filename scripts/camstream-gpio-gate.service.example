@@ -1,17 +1,24 @@
-# Пример systemd: стрим камеры только если при загрузке GPIO (BCM) замкнут на GND.
-# Скопируйте под своё дерево каталогов, поправьте User/WorkingDirectory/exec start.
+# systemd: стрим только если выбранный GPIO (BCM) при старте замкнут на GND.
+# Режим входа pull-up gpiozero: в покое высокий, к GND = низкий = запуск.
 #
-#   sudo cp scripts/camstream-gpio-gate.service.example /etc/systemd/system/camstream.service
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable camstream.service
-#   sudo systemctl start camstream.service
+# sudo cp scripts/camstream-gpio-gate.service.example /etc/systemd/system/camstream.service
+# sudo nano /etc/systemd/system/camstream.service   # User, BCM, рабочий каталог, путь к python
+# sudo systemctl daemon-reload
+# sudo systemctl enable camstream.service
+# sudo systemctl start camstream.service
 #
-# Схема: переключатель или перемычка между выбранным GPIO (BCM) и GND = запуск;
-# если линия в покое подтянута к 3V3 через внутренний pull-up — сервис ничего не запускает.
+# Проверка: sudo journalctl -u camstream.service -b --no-pager
+#
+# Если «не запускается» при замыкании на землю:
+#   - Убедитесь, что пин указан BCM (pinout.xyz), общий GND с Pi.
+#   - sudo usermod -aG gpio ваш_пользователь && перелогин (или supplementary group ниже).
+#   - gate читает GPIO через системный Python3 (apt: python3-gpiozero python3-lgpio),
+#     сам стрим — из .venv (picamera2 и т.д.).
+#   - Поднимите паузу: Environment=BOOT_GPIO_STABLE_MS=250 в [Service].
 
 [Unit]
-Description=Camera stream (start only if boot GPIO grounded)
-After=network-online.target NetworkManager.service
+Description=Camera stream (GPIO grounded = run via boot_gpio_gate)
+After=multi-user.target network-online.target NetworkManager.service
 Wants=network-online.target
 
 [Service]
@@ -20,8 +27,14 @@ User=pavel
 Group=pavel
 WorkingDirectory=/home/pavel/projects/Mobile_Raspberry_5-
 Environment=CAMSTREAM_BOOT_GPIO_BCM=17
-ExecStart=/usr/bin/python3 -m rpi_tools.boot_gpio_gate -- \
-  /usr/bin/python3 /home/pavel/projects/Mobile_Raspberry_5-/stream_camera.py send --listen --port 5000
+# Не даёт ошибок gpiozero Permission denied после перезагрузки:
+SupplementaryGroups=gpio
+Environment=BOOT_GPIO_STABLE_MS=400
+# После старта сервис до N с ждёт, пока пин замкнут на GND (удобно, если перемычку ставят после включения Pi).
+Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
+# Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); стрим — .venv.
+ExecStart=/bin/sh -lc 'exec /usr/bin/python3 -m rpi_tools.boot_gpio_gate --stable-ms "${BOOT_GPIO_STABLE_MS:-400}" --wait-ground-sec "${BOOT_GPIO_WAIT_GROUND_SEC:-60}" -- /home/pavel/projects/Mobile_Raspberry_5-/.venv/bin/python /home/pavel/projects/Mobile_Raspberry_5-/stream_camera.py send --listen --port 5000'
+
 Restart=no
 
 [Install]
