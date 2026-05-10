@@ -5,7 +5,7 @@
 Реализация разнесена по пакету ``rpi_tools/``:
 
 - ``rpi_tools/camera_stream.py`` — камера, MJPEG по TCP, UDP discovery, ``send``.
-- ``rpi_tools/romeo_usb.py`` — USB Romeo: прошивка (bootloader) и ``serial-send`` / моторы.
+- ``rpi_tools/romeo_usb.py`` — USB Romeo: прошивка (bootloader), ``serial-send``, ``adc-read`` / ``adc-cal`` (АЦП, VCC/VREF).
 - ``rpi_tools/romeo_control_server.py`` — TCP с ПК → строки на Romeo (при ``send --listen``).
 - ``rpi_tools/wifi_scan.py`` — ``wifi-scan`` (nmcli).
 - ``rpi_tools/discovery.py`` — протокол UDP handshake.

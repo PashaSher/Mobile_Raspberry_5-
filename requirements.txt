@@ -1,6 +1,12 @@
 # Raspberry Pi (передатчик камеры): venv на плате + пакеты ниже
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
+# Быстрый JPEG 4:4:4 на Pi (picamera2 без overlay — см. rpi_tools/camera_stream.py)
+simplejpeg>=1.7.1
 # CSI / libcamera: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2
 # Автозапуск по GPIO (boot_gpio_gate): pip install gpiozero
 gpiozero>=2.0.0
+# Romeo USB / serial-send / TCP→USB / LTG heartbeat (rpi_tools/romeo_usb.py)
+pyserial>=3.5
+# Автозапуск с ожиданием отладчика (scripts/camstream-gpio-gate-debug.service.example)
+debugpy>=1.8.0

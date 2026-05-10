@@ -1,0 +1,45 @@
+# systemd: как camstream.service, но вместо прямого stream_camera запускает
+# debugpy (ожидание Attach из Cursor до старта кода приложения).
+#
+# Установка (отдельный юнит, чтобы не трогать обычный автозапуск):
+#   sudo cp scripts/camstream-gpio-gate-debug.service.example /etc/systemd/system/camstream-debug.service
+#   sudo chmod +x /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_debugpy_listen.sh
+#   Отредактируйте пути User/WorkingDirectory/exec — как в вашем camstream.service
+#   /home/pavel/.../.venv/bin/python -m pip install debugpy
+#   sudo systemctl daemon-reload
+#   sudo systemctl disable camstream.service   # чтобы не два экземпляра
+#   sudo systemctl enable camstream-debug.service
+#   sudo reboot
+#
+# В Cursor на ПК (или при Remote‑SSH открытый каталог этого проекта на Pi):
+#   Run → «Python: Attach (Pi, debugpy 5678)» — когда юнит дошёл до wait-for-client.
+#
+# Если порт 5678 не нужно светить в LAN — в [Service]:
+#   Environment=DEBUGPY_LISTEN=127.0.0.1:5678
+# и с ПК туннель: ssh -L 5678:127.0.0.1:5678 pi@...
+
+[Unit]
+Description=Camera stream + debugpy wait (GPIO17 grounded after boot_gpio_gate)
+After=multi-user.target network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pavel
+Group=pavel
+WorkingDirectory=/home/pavel/projects/Mobile_Raspberry_5-
+Environment=CAMSTREAM_BOOT_GPIO_BCM=17
+SupplementaryGroups=gpio
+Environment=BOOT_GPIO_STABLE_MS=400
+Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
+Environment=DEBUGPY_LISTEN=0.0.0.0:5678
+# Лог в файл (boot_gpio_gate + обёртка debugpy): по умолчанию ~/.local/share/camstream/camstream_boot.log
+# Environment=CAMSTREAM_BOOT_LOG=/home/pavel/projects/Mobile_Raspberry_5-/logs/camstream_boot.log
+# Домашний Wi‑Fi, если приложение не запустилось: Environment=CAMSTREAM_HOME_WIFI_CONN=...
+# chmod +x .../camstream-gpio-wifi-fallback.sh
+ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_debugpy_listen.sh -- send --ap-ssid 12345 --ap-force --listen --port 5000'
+
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

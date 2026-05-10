@@ -11,12 +11,22 @@ from rpi_tools.camera_stream import _default_capture_mode, run_send
 from rpi_tools.errors import TcpBindError
 from rpi_tools.config import (
     DISCOVERY_PORT_DEFAULT,
+    JPEG_TCP_QUEUE_DEPTH_DEFAULT,
+    ROMEO_ADC_DEFAULT_CHANNEL,
     ROMEO_CONTROL_PORT_DEFAULT,
+    ROMEO_PIVOT_TANK_SCALE,
     ROMEO_TANK_SPEED_DEFAULT,
     ROMEO_USB_PORT,
 )
 from rpi_tools.logutil import setup_logging
-from rpi_tools.romeo_usb import run_flash_romeo, run_serial_send
+from rpi_tools.romeo_usb import (
+    run_adc_cal,
+    run_adc_read,
+    run_flash_romeo,
+    run_serial_send,
+    run_vbat_read,
+)
+from rpi_tools.stream_profiles import apply_stream_preset
 from rpi_tools.wifi_connect import (
     ap_password_resolve,
     run_wifi_apply_from_file,
@@ -70,19 +80,67 @@ def main() -> int:
         help="TCP-порт приёмника (если не auto; при auto берётся из ответа discovery)",
     )
     p_send.add_argument("--camera", type=int, default=0, help="Индекс камеры (0 по умолчанию)")
-    p_send.add_argument("--width", type=int, default=640, help="Ширина кадра (меньше разрешение — обычно стабильнее FPS и меньше «мазни» при узком Wi‑Fi)")
-    p_send.add_argument("--height", type=int, default=480, help="Высота кадра")
+    p_send.add_argument(
+        "--width",
+        type=int,
+        default=1280,
+        help="Ширина кадра (по умолчанию 1280 — макс. детализация на Pi; при рваном Wi‑Fi уменьшите)",
+    )
+    p_send.add_argument("--height", type=int, default=720, help="Высота кадра (по умолчанию 720p)")
     p_send.add_argument(
         "--fps",
         type=float,
-        default=25.0,
+        default=30.0,
         help="Запрошенный FPS (если камера и бэкенд реально выдают)",
     )
     p_send.add_argument(
         "--jpeg-quality",
         type=int,
-        default=88,
-        help="Качество JPEG 1–100 (выше — меньше артефактов «мыла», больше трафика; см. docs/pi-stream-quality.ru.md)",
+        default=92,
+        help="Качество JPEG 1–100 (пресет broadcast подставляет 92; см. docs/pi-stream-quality.ru.md)",
+    )
+    p_send.add_argument(
+        "--stream-preset",
+        choices=["custom", "broadcast", "cinema", "mobile"],
+        default="broadcast",
+        help=(
+            "Готовый профиль разрешения/FPS/JPEG: broadcast (720p30 эфир), cinema (720p24 макс. деталь), "
+            "mobile (960×540 стабильный Wi‑Fi). custom — только явные --width/--fps/..."
+        ),
+    )
+    p_send.add_argument(
+        "--jpeg-chroma",
+        choices=["444", "422", "420"],
+        default="422",
+        help="Субдискретизация цвета JPEG: 444 — лучше края/цвет, 420 — меньше битрейт (часто достаточно для видео).",
+    )
+    p_send.add_argument(
+        "--jpeg-threads",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Потоки кодирования picamera2 JpegEncoder (MultiEncoder + simplejpeg); обычно 6–8 на Pi 5.",
+    )
+    p_send.add_argument(
+        "--no-jpeg-fast-dct",
+        action="store_true",
+        help="Запасной цикл capture_array: точнее DCT в simplejpeg (медленнее). В основном контуре JpegEncoder не используется.",
+    )
+    p_send.add_argument(
+        "--legacy-picamera-jpeg-loop",
+        action="store_true",
+        help="Не использовать picamera2 JpegEncoder (многопоточный); только capture_array+JPEG (хуже FPS).",
+    )
+    p_send.add_argument(
+        "--jpeg-tcp-queue",
+        type=int,
+        default=JPEG_TCP_QUEUE_DEPTH_DEFAULT,
+        metavar="N",
+        help=(
+            "Очередь отправки JPEG по TCP (отдельный поток на Pi). По умолчанию %(default)s: кодер не блокируется, "
+            "если ПК/Wi‑Fi читают медленно (напр. UI занят клавишами — см. docs/pc-remote-control.ru.md). "
+            "0 — без очереди (весь sendall в потоке кодирования)."
+        ),
     )
     p_send.add_argument(
         "--discover-port",
@@ -215,8 +273,9 @@ def main() -> int:
         default=ROMEO_TANK_SPEED_DEFAULT,
         metavar="N",
         help=(
-            "Резерв CLI (раньше — модуль скорости для старого дифференциала). Вбок теперь TL/TR в прошивке; "
-            "отдельные скорости гусениц — JSON {\"action\":\"tank\",\"left\":n,\"right\":n} или строка «TANK l r»."
+            "Базовый модуль для JSON drive left/right: на Romeo уходит TANK ±mag, mag ≈ N×"
+            f"{ROMEO_PIVOT_TANK_SCALE:g} (см. rpi_tools/config ROMEO_PIVOT_TANK_SCALE). "
+            "Явный JSON tank / строка «TANK l r» не масштабируются."
         ),
     )
 
@@ -230,6 +289,13 @@ def main() -> int:
             "Если задано: для JSON «action\":\"turret» без поля «step» подставлять шаг в градусах "
             "(на Romeo уходит PANL 2 вместо голого PANL — мельче шаг при удержании клавиши на ПК)."
         ),
+    )
+    p_send.add_argument(
+        "--romeo-adc-interval",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="При --listen: раз в SEC опрашивать канал АЦП по умолчанию (A1, см. ROMEO_ADC_DEFAULT_CHANNEL) по USB. 0 — выключить.",
     )
     p_send.add_argument(
         "--romeo-led-interval",
@@ -358,7 +424,129 @@ def main() -> int:
         help="Пауза после открытия USB-порта до отправки (часто 1.5–2 с: плата успевает выйти из reset)",
     )
 
+    p_adc = sub.add_parser(
+        "adc-read",
+        help="Romeo USB: опрос АЦП A0..A5 — одна строка «A<n> raw mV» в stdout (по умолчанию канал из config)",
+    )
+    p_adc.add_argument(
+        "--port",
+        default=ROMEO_USB_PORT,
+        metavar="DEV",
+        help=f"USB CDC Romeo (по умолчанию {ROMEO_USB_PORT})",
+    )
+    p_adc.add_argument("--baud", type=int, default=115200, help="Скорость UART")
+    p_adc.add_argument(
+        "--channel",
+        "-c",
+        type=int,
+        default=ROMEO_ADC_DEFAULT_CHANNEL,
+        metavar="N",
+        help=f"Номер входа 0..5 (по умолчанию {ROMEO_ADC_DEFAULT_CHANNEL} — A{ROMEO_ADC_DEFAULT_CHANNEL})",
+    )
+    p_adc.add_argument(
+        "--read-timeout",
+        type=float,
+        default=3.0,
+        metavar="SEC",
+        help="Максимум секунд ожидания ответа",
+    )
+    p_adc.add_argument(
+        "--read-idle",
+        type=float,
+        default=0.25,
+        metavar="SEC",
+        help="Тишина на линии после последнего байта — ответ собран",
+    )
+    p_adc.add_argument(
+        "--open-delay",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Пауза после открытия порта до первой команды",
+    )
+
+    p_vbat = sub.add_parser(
+        "vbat-read",
+        help="Romeo USB: VBAT и battery_V с калибровкой U=a·U+b (см. ROMEO_BATTERY_CAL_* в config)",
+    )
+    p_vbat.add_argument(
+        "--port",
+        default=ROMEO_USB_PORT,
+        metavar="DEV",
+        help=f"USB CDC Romeo (по умолчанию {ROMEO_USB_PORT})",
+    )
+    p_vbat.add_argument("--baud", type=int, default=115200, help="Скорость UART")
+    p_vbat.add_argument(
+        "--read-timeout",
+        type=float,
+        default=3.0,
+        metavar="SEC",
+        help="Максимум секунд ожидания ответа",
+    )
+    p_vbat.add_argument(
+        "--read-idle",
+        type=float,
+        default=0.25,
+        metavar="SEC",
+        help="Тишина на линии после последнего байта — ответ собран",
+    )
+    p_vbat.add_argument(
+        "--open-delay",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Пауза после открытия порта до первой команды",
+    )
+
+    p_cal = sub.add_parser(
+        "adc-cal",
+        help="Romeo USB: калибровка АЦП — VCC, VREF, VREF <mV>, VREF AUTO (текст прошивки в stdout)",
+    )
+    p_cal.add_argument(
+        "mode",
+        choices=["vcc", "vref", "vref-auto"],
+        help="vcc — AVCC по bandgap; vref — запрос VREF; vref --set MV — ручной VREF; vref-auto — как VCC",
+    )
+    p_cal.add_argument(
+        "--set",
+        dest="vref_mv",
+        type=int,
+        default=None,
+        metavar="MV",
+        help="Только с mode=vref: задать опору VREF <MV> (500..7000 мВ)",
+    )
+    p_cal.add_argument(
+        "--port",
+        default=ROMEO_USB_PORT,
+        metavar="DEV",
+        help=f"USB CDC Romeo (по умолчанию {ROMEO_USB_PORT})",
+    )
+    p_cal.add_argument("--baud", type=int, default=115200, help="Скорость UART")
+    p_cal.add_argument(
+        "--read-timeout",
+        type=float,
+        default=5.0,
+        metavar="SEC",
+        help="Ожидание ответа (VCC/bandgap может быть медленным; по умолчанию 5 с)",
+    )
+    p_cal.add_argument(
+        "--read-idle",
+        type=float,
+        default=0.25,
+        metavar="SEC",
+        help="Тишина на линии после последнего байта — ответ собран",
+    )
+    p_cal.add_argument(
+        "--open-delay",
+        type=float,
+        default=0.0,
+        metavar="SEC",
+        help="Пауза после открытия порта до первой команды",
+    )
+
     args = parser.parse_args()
+    if args.cmd == "send":
+        apply_stream_preset(args)
     level = logging.DEBUG if args.verbose else getattr(logging, args.log_level)
     setup_logging(level)
     log.info("camstream: команда=%s, уровень логов=%s", args.cmd, logging.getLevelName(level))
@@ -394,6 +582,45 @@ def main() -> int:
 
     if args.cmd == "flash-romeo":
         run_flash_romeo(args.hex)
+        return 0
+
+    if args.cmd == "adc-read":
+        run_adc_read(
+            args.port,
+            args.baud,
+            args.channel,
+            args.read_timeout,
+            args.read_idle,
+            args.open_delay,
+        )
+        return 0
+
+    if args.cmd == "vbat-read":
+        run_vbat_read(
+            args.port,
+            args.baud,
+            args.read_timeout,
+            args.read_idle,
+            args.open_delay,
+        )
+        return 0
+
+    if args.cmd == "adc-cal":
+        if args.mode == "vref" and args.vref_mv is not None:
+            if not (500 <= args.vref_mv <= 7000):
+                log.error("adc-cal: --set MV должно быть в диапазоне 500..7000")
+                return 1
+        if args.mode == "vref-auto" and args.vref_mv is not None:
+            log.warning("adc-cal: --set игнорируется для vref-auto")
+        run_adc_cal(
+            args.port,
+            args.baud,
+            args.mode,
+            args.vref_mv if args.mode == "vref" else None,
+            args.read_timeout,
+            args.read_idle,
+            args.open_delay,
+        )
         return 0
 
     if args.cmd in ("serial-send", "romeo"):
@@ -460,6 +687,12 @@ def main() -> int:
                 romeo_tank_speed=args.romeo_tank_speed,
                 romeo_turret_step=args.romeo_turret_step,
                 romeo_led_interval_sec=args.romeo_led_interval,
+                romeo_adc_interval_sec=args.romeo_adc_interval,
+                picamera_use_jpeg_encoder=not args.legacy_picamera_jpeg_loop,
+                jpeg_chroma_subsampling=args.jpeg_chroma,
+                jpeg_encoder_threads=args.jpeg_threads,
+                jpeg_fast_dct=not args.no_jpeg_fast_dct,
+                jpeg_tcp_queue_depth=args.jpeg_tcp_queue,
             )
         except TcpBindError:
             return 3

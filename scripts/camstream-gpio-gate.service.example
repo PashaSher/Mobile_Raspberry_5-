@@ -1,6 +1,9 @@
 # systemd: стрим только если выбранный GPIO (BCM) при старте замкнут на GND.
 # Режим входа pull-up gpiozero: в покое высокий, к GND = низкий = запуск.
 #
+# Отладчик при включении Pi (GPIO17 → GND, ждёт Attach в Cursor — см. debugpy):
+#   scripts/camstream-gpio-gate-debug.service.example
+#
 # sudo cp scripts/camstream-gpio-gate.service.example /etc/systemd/system/camstream.service
 # sudo nano /etc/systemd/system/camstream.service   # User, BCM, рабочий каталог, путь к python
 # sudo systemctl daemon-reload
@@ -8,6 +11,16 @@
 # sudo systemctl start camstream.service
 #
 # Проверка: sudo journalctl -u camstream.service -b --no-pager
+# Отдельный лог gate/debug (до запуска stream_camera): см. ~/.local/share/camstream/camstream_boot.log
+#   или: Environment=CAMSTREAM_BOOT_LOG=/home/pavel/.../logs/camstream_boot.log
+#
+# Hotspot (точка доступа) поднимается только когда реально стартует stream_camera с --ap-ssid …
+# Если GPIO не дал запуск приложения — подключение к дому (сохранённый профиль NM):
+#   chmod +x scripts/camstream-gpio-wifi-fallback.sh
+#   Environment=CAMSTREAM_HOME_WIFI_CONN=ИмяКакВ_nmcli_connection
+#   ExecStart=.../camstream-gpio-wifi-fallback.sh send --ap-ssid 12345 --ap-force --listen --port 5000
+# Имя профиля: nmcli -t -f NAME connection show
+# Отключите autoconnect у отдельного профиля «hotspot», если он мешал домашнему Wi‑Fi при загрузке.
 #
 # Если «не запускается» при замыкании на землю:
 #   - Убедитесь, что пин указан BCM (pinout.xyz), общий GND с Pi.
@@ -32,8 +45,10 @@ SupplementaryGroups=gpio
 Environment=BOOT_GPIO_STABLE_MS=400
 # После старта сервис до N с ждёт, пока пин замкнут на GND (удобно, если перемычку ставят после включения Pi).
 Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
-# Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); стрим — .venv.
-ExecStart=/bin/sh -lc 'exec /usr/bin/python3 -m rpi_tools.boot_gpio_gate --stable-ms "${BOOT_GPIO_STABLE_MS:-400}" --wait-ground-sec "${BOOT_GPIO_WAIT_GROUND_SEC:-60}" -- /home/pavel/projects/Mobile_Raspberry_5-/.venv/bin/python /home/pavel/projects/Mobile_Raspberry_5-/stream_camera.py send --listen --port 5000'
+# Имя подключения NetworkManager к домашнему Wi‑Fi (когда приложение не запускается по GPIO):
+# Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
+# Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); обёртка — .venv stream_camera; --ap-ssid только здесь (hotspot при запуске приложения).
+ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh send --ap-ssid 12345 --ap-force --listen --port 5000'
 
 Restart=no
 

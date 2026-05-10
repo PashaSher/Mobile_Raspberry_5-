@@ -86,6 +86,22 @@
       "preLaunchTask": "free-camstream-debug-ports"
     },
     {
+      "name": "Python: Attach (Pi boot, debugpy :5678)",
+      "type": "python",
+      "request": "attach",
+      "connect": {
+        "host": "localhost",
+        "port": 5678
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "${workspaceFolder}"
+        }
+      ],
+      "justMyCode": true
+    },
+    {
       "name": "RPI: wifi-scan",
       "type": "python",
       "request": "launch",
