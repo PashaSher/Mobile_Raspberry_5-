@@ -50,7 +50,7 @@ def _print_hotspot_blocked_hint() -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Raspberry Pi: камера (TCP MJPEG + UDP discovery), Romeo USB, Wi‑Fi, прошивка"
+        description="Raspberry Pi: камера (H.264/TCP/UDP + legacy JPEG/TCP + UDP discovery), Romeo USB, Wi‑Fi, прошивка"
     )
     parser.add_argument(
         "--log-level",
@@ -67,26 +67,26 @@ def main() -> int:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_send = sub.add_parser("send", help="Стрим камеры Raspberry Pi")
+    p_send = sub.add_parser("send", help="Стрим камеры Raspberry Pi (UDP/H.264, H.264/TCP, RTSP, legacy JPEG/TCP)")
     p_send.add_argument(
         "--host",
         default="auto",
-        help="IP приёмника в LAN или auto — поиск по UDP (приложение на ПК должно отвечать на discover)",
+        help="IP приёмника/ПК в LAN или auto — поиск по UDP (для udp_h264/rtp_h264 укажите IP ПК явно; для rtsp_h264 не используется)",
     )
     p_send.add_argument(
         "--port",
         type=int,
         default=5000,
-        help="TCP-порт приёмника (если не auto; при auto берётся из ответа discovery)",
+        help="Порт видеопотока: TCP/UDP порт видео или RTSP service port для rtsp_h264 (по умолчанию RTSP обычно 8554)",
     )
     p_send.add_argument("--camera", type=int, default=0, help="Индекс камеры (0 по умолчанию)")
     p_send.add_argument(
         "--width",
         type=int,
-        default=1280,
-        help="Ширина кадра (по умолчанию 1280 — макс. детализация на Pi; при рваном Wi‑Fi уменьшите)",
+        default=1920,
+        help="Ширина кадра (для custom по умолчанию 1920; preset broadcast/cinema тоже подставляют 1080p)",
     )
-    p_send.add_argument("--height", type=int, default=720, help="Высота кадра (по умолчанию 720p)")
+    p_send.add_argument("--height", type=int, default=1080, help="Высота кадра (для custom по умолчанию 1080)")
     p_send.add_argument(
         "--fps",
         type=float,
@@ -101,35 +101,81 @@ def main() -> int:
     )
     p_send.add_argument(
         "--stream-preset",
-        choices=["custom", "broadcast", "cinema", "mobile"],
+        choices=["custom", "broadcast", "cinema", "mobile", "realtime"],
         default="broadcast",
         help=(
-            "Готовый профиль разрешения/FPS/JPEG: broadcast (720p30 эфир), cinema (720p24 макс. деталь), "
-            "mobile (960×540 стабильный Wi‑Fi). custom — только явные --width/--fps/..."
+            "Готовый профиль разрешения/FPS/битрейта: broadcast (1080p30 высокий битрейт), "
+            "cinema (1080p24 максимум качества), mobile (720p30 для слабее канала), "
+            "realtime (960x540 для минимальной задержки). "
+            "custom — только явные --width/--fps/..."
         ),
+    )
+    p_send.add_argument(
+        "--video-mode",
+        choices=["auto", "h264_tcp", "udp_h264", "rtp_h264", "rtsp_h264", "jpeg_tcp"],
+        default="auto",
+        help=(
+            "Режим передачи видео: auto — H.264/TCP в --listen без overlay или стабильный udp_h264 при явном --host; "
+            "иначе legacy JPEG/TCP; h264_tcp — аппаратный libcamera/rpicam путь через TCP listen; "
+            "udp_h264 — основной операторский low-latency путь: H.264 в MPEG-TS/UDP на --host:<port>; "
+            "rtp_h264 — временный alias на udp_h264, пока RTP-совместимость дорабатывается; "
+            "rtsp_h264 — RTSP/H.264 server на Pi для клиентов по rtsp://<pi-ip>:<port>/<path>; "
+            "jpeg_tcp — старый кастомный протокол 4 байта + JPEG."
+        ),
+    )
+    p_send.add_argument(
+        "--video-bitrate",
+        type=int,
+        default=40_000_000,
+        metavar="BPS",
+        help="Целевой битрейт для H.264 режима в бит/с (по умолчанию 40000000 = 40 Мбит/с).",
+    )
+    p_send.add_argument(
+        "--video-intra",
+        type=int,
+        default=15,
+        metavar="N",
+        help="Интервал I-frame / IDR для H.264 режима (по умолчанию 15 кадров; меньше — быстрее recovery и ниже задержка).",
+    )
+    p_send.add_argument(
+        "--video-profile",
+        choices=["baseline", "main", "high"],
+        default="high",
+        help="H.264 profile для нового потока (по умолчанию high).",
+    )
+    p_send.add_argument(
+        "--video-level",
+        default=None,
+        metavar="LVL",
+        help="Опциональный H.264 level для системного энкодера (например 4.2).",
+    )
+    p_send.add_argument(
+        "--rtsp-path",
+        default="camera",
+        help="RTSP mount path для rtsp_h264 (по умолчанию /camera).",
     )
     p_send.add_argument(
         "--jpeg-chroma",
         choices=["444", "422", "420"],
         default="422",
-        help="Субдискретизация цвета JPEG: 444 — лучше края/цвет, 420 — меньше битрейт (часто достаточно для видео).",
+        help="Legacy JPEG/TCP: субдискретизация цвета JPEG: 444 — лучше края/цвет, 420 — меньше битрейт.",
     )
     p_send.add_argument(
         "--jpeg-threads",
         type=int,
         default=8,
         metavar="N",
-        help="Потоки кодирования picamera2 JpegEncoder (MultiEncoder + simplejpeg); обычно 6–8 на Pi 5.",
+        help="Legacy JPEG/TCP: потоки кодирования picamera2 JpegEncoder (MultiEncoder + simplejpeg).",
     )
     p_send.add_argument(
         "--no-jpeg-fast-dct",
         action="store_true",
-        help="Запасной цикл capture_array: точнее DCT в simplejpeg (медленнее). В основном контуре JpegEncoder не используется.",
+        help="Legacy JPEG/TCP: запасной цикл capture_array использует точнее DCT в simplejpeg (медленнее).",
     )
     p_send.add_argument(
         "--legacy-picamera-jpeg-loop",
         action="store_true",
-        help="Не использовать picamera2 JpegEncoder (многопоточный); только capture_array+JPEG (хуже FPS).",
+        help="Legacy JPEG/TCP: не использовать picamera2 JpegEncoder; только capture_array+JPEG (хуже FPS).",
     )
     p_send.add_argument(
         "--jpeg-tcp-queue",
@@ -137,8 +183,8 @@ def main() -> int:
         default=JPEG_TCP_QUEUE_DEPTH_DEFAULT,
         metavar="N",
         help=(
-            "Очередь отправки JPEG по TCP (отдельный поток на Pi). По умолчанию %(default)s: кодер не блокируется, "
-            "если ПК/Wi‑Fi читают медленно (напр. UI занят клавишами — см. docs/pc-remote-control.ru.md). "
+            "Legacy JPEG/TCP: очередь отправки JPEG по TCP (отдельный поток на Pi). "
+            "По умолчанию %(default)s: кодер не блокируется, если ПК/Wi‑Fi читают медленно. "
             "0 — без очереди (весь sendall в потоке кодирования)."
         ),
     )
@@ -189,7 +235,7 @@ def main() -> int:
     p_send.add_argument(
         "--timestamp",
         action="store_true",
-        help="Рисовать дату и время на каждом кадре (на стороне камеры, до JPEG); добавляет мелкий шум в сжатии",
+        help="Рисовать дату и время на каждом кадре; для H.264 режимов не поддерживается и форсирует legacy JPEG/TCP.",
     )
     p_send.add_argument(
         "--camera-device",
@@ -212,7 +258,11 @@ def main() -> int:
         "--capture",
         choices=["auto", "opencv", "picamera2"],
         default=_default_capture_mode(),
-        help="Захват: на Raspberry Pi по умолчанию picamera2; auto — OpenCV, при неудаче picamera2; opencv — только OpenCV",
+        help=(
+            "Захват для legacy JPEG/TCP: на Raspberry Pi по умолчанию picamera2; "
+            "auto — OpenCV, при неудаче picamera2; opencv — только OpenCV. "
+            "H.264 режимы используют системный rpicam/libcamera путь."
+        ),
     )
     p_send.add_argument(
         "--ap-ssid",
@@ -680,6 +730,12 @@ def main() -> int:
                 args.capture_backend,
                 not args.no_set_fps,
                 args.capture,
+                video_mode=args.video_mode,
+                video_bitrate=args.video_bitrate,
+                video_intra=args.video_intra,
+                video_profile=args.video_profile,
+                rtsp_path=args.rtsp_path,
+                video_level=args.video_level,
                 romeo_control_port=args.romeo_control_port,
                 romeo_usb_port=args.romeo_usb,
                 romeo_baud=args.romeo_baud,

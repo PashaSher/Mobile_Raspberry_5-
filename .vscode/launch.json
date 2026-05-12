@@ -2,7 +2,7 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "RPI: send + AP 12345 (по умолчанию, --ap-force)",
+      "name": "RPI: hotspot udp_h264",
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/stream_camera.py",
@@ -10,108 +10,20 @@
       "cwd": "${workspaceFolder}",
       "args": [
         "send",
+        "--video-mode",
+        "udp_h264",
         "--ap-ssid",
         "12345",
         "--ap-force",
-        "--listen",
+        "--host",
+        "10.42.0.194",
         "--port",
         "5000",
-        "--romeo-turret-step",
-        "2"
+        "--stream-preset",
+        "realtime"
       ],
       "justMyCode": true,
       "preLaunchTask": "free-camstream-debug-ports"
-    },
-    {
-      "name": "RPI: send + AP 12345 (только при подключённом eth0)",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/stream_camera.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "send",
-        "--ap-ssid",
-        "12345",
-        "--listen",
-        "--port",
-        "5000",
-        "--romeo-turret-step",
-        "2"
-      ],
-      "justMyCode": true,
-      "preLaunchTask": "free-camstream-debug-ports"
-    },
-    {
-      "name": "RPI: send + AP 12345 + timestamp (--ap-force)",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/stream_camera.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "send",
-        "--ap-ssid",
-        "12345",
-        "--ap-force",
-        "--listen",
-        "--port",
-        "5000",
-        "--romeo-turret-step",
-        "2",
-        "--timestamp"
-      ],
-      "justMyCode": true,
-      "preLaunchTask": "free-camstream-debug-ports"
-    },
-    {
-      "name": "RPI: send + AP 12345 + timestamp (только при eth0)",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/stream_camera.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "send",
-        "--ap-ssid",
-        "12345",
-        "--listen",
-        "--port",
-        "5000",
-        "--romeo-turret-step",
-        "2",
-        "--timestamp"
-      ],
-      "justMyCode": true,
-      "preLaunchTask": "free-camstream-debug-ports"
-    },
-    {
-      "name": "Python: Attach (Pi boot, debugpy :5678)",
-      "type": "python",
-      "request": "attach",
-      "connect": {
-        "host": "localhost",
-        "port": 5678
-      },
-      "pathMappings": [
-        {
-          "localRoot": "${workspaceFolder}",
-          "remoteRoot": "${workspaceFolder}"
-        }
-      ],
-      "justMyCode": true
-    },
-    {
-      "name": "RPI: wifi-scan",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/stream_camera.py",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "args": [
-        "wifi-scan"
-      ],
-      "justMyCode": true
     }
   ]
 }

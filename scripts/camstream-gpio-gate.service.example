@@ -18,7 +18,7 @@
 # Если GPIO не дал запуск приложения — подключение к дому (сохранённый профиль NM):
 #   chmod +x scripts/camstream-gpio-wifi-fallback.sh
 #   Environment=CAMSTREAM_HOME_WIFI_CONN=ИмяКакВ_nmcli_connection
-#   ExecStart=.../camstream-gpio-wifi-fallback.sh send --ap-ssid 12345 --ap-force --listen --port 5000
+#   ExecStart=.../camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --ap-ssid 12345 --ap-force --host 10.42.0.194 --port 5000 --stream-preset realtime
 # Имя профиля: nmcli -t -f NAME connection show
 # Отключите autoconnect у отдельного профиля «hotspot», если он мешал домашнему Wi‑Fi при загрузке.
 #
@@ -47,8 +47,9 @@ Environment=BOOT_GPIO_STABLE_MS=400
 Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
 # Имя подключения NetworkManager к домашнему Wi‑Fi (когда приложение не запускается по GPIO):
 # Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
-# Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); обёртка — .venv stream_camera; --ap-ssid только здесь (hotspot при запуске приложения).
-ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh send --ap-ssid 12345 --ap-force --listen --port 5000'
+# Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); обёртка — .venv stream_camera.
+# Для стабильного operator video после power-up используем udp_h264; IP ПК в hotspot при необходимости замените.
+ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --ap-ssid 12345 --ap-force --host 10.42.0.194 --port 5000 --stream-preset realtime'
 
 Restart=no
 

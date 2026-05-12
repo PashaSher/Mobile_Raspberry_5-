@@ -113,6 +113,9 @@ def _discovery_responder_loop(
     http_port: int | None,
     control_tcp_port: int | None,
     token: str | None,
+    video_transport: str | None,
+    video_codec: str | None,
+    video_mode: str | None,
 ) -> None:
     while True:
         try:
@@ -138,6 +141,12 @@ def _discovery_responder_loop(
             rsp["http"] = http_port
         if control_tcp_port is not None and control_tcp_port > 0:
             rsp["control"] = control_tcp_port
+        if video_transport:
+            rsp["video_transport"] = video_transport
+        if video_codec:
+            rsp["video_codec"] = video_codec
+        if video_mode:
+            rsp["video_mode"] = video_mode
         try:
             udp_sock.sendto(json.dumps(rsp, separators=(",", ":")).encode("utf-8"), addr)
             log.debug("discovery: отправлен hello → %s tcp=%s", addr[0], tcp_port)
@@ -151,6 +160,9 @@ def _start_discovery_responder(
     http_port: int | None,
     token: str | None,
     control_tcp_port: int | None = None,
+    video_transport: str | None = None,
+    video_codec: str | None = None,
+    video_mode: str | None = None,
 ) -> tuple[socket.socket, threading.Thread]:
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -162,7 +174,7 @@ def _start_discovery_responder(
     log.info("UDP discovery: слушаем 0.0.0.0:%s (ответы на handshake)", discover_port)
     th = threading.Thread(
         target=_discovery_responder_loop,
-        args=(udp, tcp_port, http_port, control_tcp_port, token),
+        args=(udp, tcp_port, http_port, control_tcp_port, token, video_transport, video_codec, video_mode),
         daemon=True,
     )
     th.start()

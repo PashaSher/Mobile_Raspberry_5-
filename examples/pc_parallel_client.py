@@ -1,104 +1,251 @@
 #!/usr/bin/env python3
 """
-ПК: видео и управление Romeo — параллельно (разные потоки, два TCP-сокета).
+ПК: внешний player для H.264/TCP, MPEG-TS/UDP или RTP/UDP + управление Romeo по отдельному TCP.
 
-Пока главный поток ждёт ввод команд или шлёт stress-тест, поток ``video-tcp``
-непрерывно читает кадры с Pi — буфер видео не растёт и картинка не «замирает».
+По умолчанию скрипт запускает ``GStreamer`` для видео и держит отдельное соединение
+с control-портом Pi. Видео больше не читается кастомным Python-приёмником:
+основной поток на Pi теперь аппаратный H.264 по TCP, H.264 в MPEG-TS/UDP или RTP/UDP.
 
-Запуск на удалённом ПК (скопируйте файл или весь репозиторий):
+Примеры:
 
   python3 examples/pc_parallel_client.py --host 192.168.1.50
-
-Окно предпросмотра (нужен OpenCV):
-
-  pip install opencv-python-headless numpy
-  python3 examples/pc_parallel_client.py --host IP_PI --window
-  # Напряжение аккумулятора (делитель на канале АЦП по умолчанию, см. ROMEO_ADC_DEFAULT_CHANNEL в config) на кадре:
-  python3 examples/pc_parallel_client.py --host IP_PI --window --battery-interval 0.5
-
-Имитация «зажатой кнопки» (частые команды в отдельном потоке — видео всё равно в своём):
-
-  python3 examples/pc_parallel_client.py --host IP_PI --stress --stress-interval 0.03
-
-См. также docs/pc-remote-control.ru.md §6.
+  python3 examples/pc_parallel_client.py --host 192.168.1.50 --video-transport udp
+  python3 examples/pc_parallel_client.py --host 192.168.1.50 --player vlc
+  python3 examples/pc_parallel_client.py --host 192.168.1.50 --video-transport rtp --player gstreamer
+  python3 examples/pc_parallel_client.py --host 192.168.1.50 --player none --stress
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import queue
+import os
+from pathlib import Path
+import shutil
 import socket
-import struct
+import subprocess
 import sys
 import threading
 import time
+from shlex import join as shlex_join
+
+_CAMERA_SHORTCUT_HELP = (
+    "[control] camera shortcuts:\n"
+    "  preset auto|day|cloudy|indoor|night|sport|hdr|mono\n"
+    "  day | night | cloudy | indoor | sport | hdr | mono | auto\n"
+    "  zoom+ | zoom- | zoom reset | zoom <factor>\n"
+    "  cam status | cam presets\n"
+    "Остальные строки уходят как raw JSON или Romeo-команды."
+)
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    chunks: list[bytes] = []
-    left = n
-    while left > 0:
-        part = sock.recv(left)
-        if not part:
-            raise EOFError("TCP закрыт")
-        chunks.append(part)
-        left -= len(part)
-    return b"".join(chunks)
+def _translate_control_shortcut(raw: str) -> tuple[str | None, str | None]:
+    """Преобразует короткие команды ПК в JSON control-команды для Pi."""
+    text = raw.strip()
+    if not text:
+        return None, None
+    low = text.lower()
+    if low in ("help", "cam-help"):
+        return None, _CAMERA_SHORTCUT_HELP
+
+    preset_aliases = {
+        "auto": "auto",
+        "day": "day",
+        "cloudy": "cloudy",
+        "indoor": "indoor",
+        "night": "night",
+        "sport": "sport",
+        "hdr": "hdr",
+        "mono": "mono",
+        "bw": "mono",
+    }
+    if low in preset_aliases:
+        return json.dumps({"action": "camera_preset", "preset": preset_aliases[low]}, ensure_ascii=False), None
+    if low in ("zoom+", "zin", "zoom in"):
+        return json.dumps({"action": "camera_zoom", "op": "in"}, ensure_ascii=False), None
+    if low in ("zoom-", "zout", "zoom out"):
+        return json.dumps({"action": "camera_zoom", "op": "out"}, ensure_ascii=False), None
+    if low in ("zoom reset", "zoom 1", "zoom 1.0"):
+        return json.dumps({"action": "camera_zoom", "op": "reset"}, ensure_ascii=False), None
+    if low == "cam status":
+        return json.dumps({"action": "camera_status"}, ensure_ascii=False), None
+    if low == "cam presets":
+        return json.dumps({"action": "camera_presets"}, ensure_ascii=False), None
+
+    parts = low.split()
+    if len(parts) == 2 and parts[0] == "preset" and parts[1] in preset_aliases:
+        return json.dumps({"action": "camera_preset", "preset": preset_aliases[parts[1]]}, ensure_ascii=False), None
+    if len(parts) == 2 and parts[0] == "zoom":
+        try:
+            factor = float(parts[1])
+        except ValueError:
+            pass
+        else:
+            return json.dumps({"action": "camera_zoom", "factor": factor}, ensure_ascii=False), None
+
+    return text, None
 
 
-def video_receiver(
-    host: str,
-    port: int,
-    stop: threading.Event,
-    frame_queue: queue.Queue | None,
-    quiet: bool,
-) -> None:
-    """Только читает видео-поток (протокол: 4 байта BE длина + JPEG)."""
-    tag = "video"
+def _video_sink_command() -> list[str]:
+    if sys.platform.startswith("win"):
+        return ["d3d11videosink", "sync=false"]
+    return ["autovideosink", "sync=false"]
+
+
+def _gstreamer_binary() -> str:
+    env_path = os.environ.get("GST_LAUNCH_1_0") or os.environ.get("GST_LAUNCH")
+    if env_path:
+        return env_path
+    resolved = shutil.which("gst-launch-1.0")
+    if resolved:
+        return resolved
+    if sys.platform.startswith("win"):
+        candidates = [
+            Path.home() / "AppData/Local/Programs/gstreamer/1.0/msvc_x86_64/bin/gst-launch-1.0.exe",
+            Path(r"C:\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe"),
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+    return "gst-launch-1.0"
+
+
+def build_player_command(player: str, transport: str, host: str, port: int) -> list[str]:
+    is_udp = transport == "udp"
+    is_rtp = transport == "rtp"
+    sink_cmd = _video_sink_command()
+    if player == "ffplay":
+        if is_rtp:
+            raise ValueError("RTP operator mode рассчитан на GStreamer receiver (--player gstreamer)")
+        cmd = [
+            "ffplay",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-framedrop",
+            "-avioflags",
+            "direct",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "0",
+        ]
+        cmd.append(f"udp://@:{port}" if is_udp else f"tcp://{host}:{port}")
+        return cmd
+    if player == "vlc":
+        if is_rtp:
+            raise ValueError("RTP operator mode рассчитан на GStreamer receiver (--player gstreamer)")
+        return ["vlc", f"udp://@:{port}"] if is_udp else ["vlc", f"tcp/h264://{host}:{port}"]
+    if player == "gstreamer":
+        gst = _gstreamer_binary()
+        if is_rtp:
+            return [
+                gst,
+                "-q",
+                "udpsrc",
+                f"port={port}",
+                "buffer-size=262144",
+                "caps=application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000",
+                "!",
+                "queue",
+                "max-size-time=0",
+                "max-size-bytes=0",
+                "max-size-buffers=4",
+                "leaky=downstream",
+                "!",
+                "rtpjitterbuffer",
+                "latency=10",
+                "drop-on-latency=true",
+                "faststart-min-packets=1",
+                "!",
+                "rtph264depay",
+                "request-keyframe=true",
+                "wait-for-keyframe=true",
+                "!",
+                "h264parse",
+                "disable-passthrough=true",
+                "!",
+                "decodebin",
+                "!",
+                "queue",
+                "max-size-time=0",
+                "max-size-bytes=0",
+                "max-size-buffers=1",
+                "leaky=downstream",
+                "!",
+                "videoconvert",
+                "!",
+                *sink_cmd,
+            ]
+        if is_udp:
+            if sys.platform.startswith("win"):
+                return [
+                    gst,
+                    "-q",
+                    "udpsrc",
+                    f"port={port}",
+                    "buffer-size=262144",
+                    "!",
+                    "tsdemux",
+                    "!",
+                    "h264parse",
+                    "!",
+                    "avdec_h264",
+                    "!",
+                    "videoconvert",
+                    "!",
+                    *sink_cmd,
+                ]
+            return [
+                gst,
+                "-q",
+                "udpsrc",
+                f"port={port}",
+                "buffer-size=262144",
+                "!",
+                "tsdemux",
+                "!",
+                "h264parse",
+                "!",
+                "decodebin",
+                "!",
+                "videoconvert",
+                "!",
+                *sink_cmd,
+            ]
+        return [
+            gst,
+            "tcpclientsrc",
+            f"host={host}",
+            f"port={port}",
+            "!",
+            "h264parse",
+            "!",
+            "avdec_h264",
+            "!",
+            "videoconvert",
+            "!",
+            *sink_cmd,
+        ]
+    raise ValueError(f"неизвестный player: {player!r}")
+
+
+def launch_player(player: str, transport: str, host: str, port: int, quiet: bool) -> subprocess.Popen | None:
+    if player == "none":
+        return None
     try:
-        with socket.create_connection((host, port), timeout=15) as s:
-            if not quiet:
-                print(f"[{tag}] TCP {host}:{port}", flush=True)
-            n_frames = 0
-            n_bytes = 0
-            t0 = time.monotonic()
-            last_report = t0
-            while not stop.is_set():
-                try:
-                    hdr = recv_exact(s, 4)
-                except EOFError:
-                    break
-                (length,) = struct.unpack(">I", hdr)
-                payload = recv_exact(s, length)
-                n_frames += 1
-                n_bytes += len(payload)
-                if frame_queue is not None:
-                    try:
-                        frame_queue.put_nowait(payload)
-                    except queue.Full:
-                        try:
-                            frame_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            frame_queue.put_nowait(payload)
-                        except queue.Full:
-                            pass
-                now = time.monotonic()
-                if not quiet and now - last_report >= 2.0:
-                    dt = now - t0
-                    fps = n_frames / dt if dt > 0 else 0.0
-                    mb_s = (n_bytes / max(dt, 1e-9)) / (1024 * 1024)
-                    print(f"[{tag}] кадров={n_frames}  ~{fps:.1f} FPS  ~{mb_s:.2f} MiB/s", flush=True)
-                    last_report = now
-    except OSError as e:
-        if not stop.is_set():
-            print(f"[{tag}] ошибка: {e}", file=sys.stderr, flush=True)
-    finally:
-        stop.set()
-        if not quiet:
-            print(f"[{tag}] поток остановлен", flush=True)
+        cmd = build_player_command(player, transport, host, port)
+    except ValueError as exc:
+        print(f"[video] {exc}", file=sys.stderr, flush=True)
+        return None
+    if not quiet:
+        print(f"[video] запуск: {shlex_join(cmd)}", flush=True)
+    try:
+        return subprocess.Popen(cmd)
+    except FileNotFoundError:
+        print(f"[video] не найден player: {player}", file=sys.stderr, flush=True)
+        return None
 
 
 def _read_json_line(sock: socket.socket, buf: bytearray, deadline: float) -> tuple[dict | None, bool]:
@@ -134,6 +281,7 @@ def control_interactive(host: str, port: int, stop: threading.Event, quiet: bool
     try:
         if not quiet:
             print(f"[{tag}] TCP {host}:{port} — вводите строки (JSON или MF), пусто — выход", flush=True)
+            print(_CAMERA_SHORTCUT_HELP, flush=True)
         while not stop.is_set():
             try:
                 line = input("control> ")
@@ -142,7 +290,13 @@ def control_interactive(host: str, port: int, stop: threading.Event, quiet: bool
             raw = line.strip()
             if not raw:
                 break
-            s.sendall((raw + "\n").encode("utf-8"))
+            outgoing, local_text = _translate_control_shortcut(raw)
+            if local_text is not None:
+                print(local_text, flush=True)
+                continue
+            if not outgoing:
+                continue
+            s.sendall((outgoing + "\n").encode("utf-8"))
             obj, closed = _read_json_line(s, buf, time.monotonic() + 5.0)
             if closed:
                 break
@@ -203,11 +357,8 @@ def battery_sampler(
     interval: float,
     stop: threading.Event,
     quiet: bool,
-    *,
-    overlay_holder: dict | None,
-    overlay_lock: threading.Lock | None,
 ) -> None:
-    """Опрос JSON adc_read; либо кладёт battery_v в overlay_holder, либо печатает в stdout."""
+    """Опрос JSON adc_read и вывод battery_v в stdout."""
     tag = "battery"
     buf = bytearray()
     cmd = b'{"action":"adc_read"}\n'
@@ -228,10 +379,7 @@ def battery_sampler(
                 break
             if obj and obj.get("ok") and "battery_v" in obj:
                 v = float(obj["battery_v"])
-                if overlay_holder is not None and overlay_lock is not None:
-                    with overlay_lock:
-                        overlay_holder["battery_v"] = v
-                elif not quiet:
+                if not quiet:
                     print(f"[{tag}] {v:.2f} V (аккумулятор, АЦП по умолчанию на Pi)", flush=True)
             if stop.wait(max(0.05, interval)):
                 break
@@ -242,69 +390,24 @@ def battery_sampler(
             pass
 
 
-def display_loop(
-    frame_queue: queue.Queue,
-    stop: threading.Event,
-    overlay_holder: dict | None,
-    overlay_lock: threading.Lock | None,
-) -> None:
-    try:
-        import cv2  # type: ignore
-        import numpy as np  # type: ignore
-    except ImportError:
-        print("[display] pip install opencv-python-headless numpy", file=sys.stderr, flush=True)
-        return
-    while not stop.is_set():
-        try:
-            jpeg = frame_queue.get(timeout=0.25)
-        except queue.Empty:
-            continue
-        arr = np.frombuffer(jpeg, dtype=np.uint8)
-        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if frame is None:
-            continue
-        if overlay_holder is not None and overlay_lock is not None:
-            with overlay_lock:
-                v = overlay_holder.get("battery_v")
-            if v is not None:
-                label = f"Battery: {v:.1f} V"
-                cv2.putText(
-                    frame,
-                    label,
-                    (10, 36),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (0, 0, 0),
-                    4,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    frame,
-                    label,
-                    (10, 36),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.9,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-        cv2.imshow("Pi stream (parallel)", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            stop.set()
-            break
-    try:
-        cv2.destroyAllWindows()
-    except Exception:
-        pass
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="ПК: параллельно видео TCP + управление TCP")
+    ap = argparse.ArgumentParser(description="ПК: внешний GStreamer/VLC/ffplay для H.264 TCP/UDP/RTP + управление TCP")
     ap.add_argument("--host", required=True, help="IP Raspberry Pi")
     ap.add_argument("--video-port", type=int, default=5000)
     ap.add_argument("--control-port", type=int, default=5001)
-    ap.add_argument("--no-control", action="store_true", help="только поток видео")
-    ap.add_argument("--window", action="store_true", help="окно OpenCV (отдельный поток)")
+    ap.add_argument(
+        "--video-transport",
+        choices=["tcp", "udp", "rtp"],
+        default="udp",
+        help="Транспорт видеопотока с Pi: udp (mpeg-ts, рекомендуется), tcp или rtp.",
+    )
+    ap.add_argument(
+        "--player",
+        choices=["ffplay", "vlc", "gstreamer", "none"],
+        default="gstreamer",
+        help="Чем открывать видео с Pi (по умолчанию gstreamer; для RTP helper тоже использует gstreamer).",
+    )
+    ap.add_argument("--no-control", action="store_true", help="не открывать control-сессию, только видео")
     ap.add_argument("--stress", action="store_true", help="фоном слать drive forward с интервалом")
     ap.add_argument("--stress-interval", type=float, default=0.03, help="сек между командами")
     ap.add_argument("--stress-seconds", type=float, default=8.0, help="длительность stress")
@@ -314,35 +417,20 @@ def main() -> int:
         type=float,
         default=0.0,
         metavar="SEC",
-        help="Опрос АЦП на Pi (JSON adc_read, канал по умолчанию — A1); вывод battery_v: на кадр при --window, иначе в stdout",
+        help="Опрос АЦП на Pi (JSON adc_read, канал по умолчанию — A1); вывод battery_v в stdout",
     )
     args = ap.parse_args()
 
+    player = args.player
+    if args.video_transport == "rtp" and player == "ffplay":
+        player = "gstreamer"
+        if not args.quiet:
+            print("[video] RTP mode: автоматически выбран GStreamer receiver", flush=True)
+
     stop = threading.Event()
-    frame_queue: queue.Queue | None = queue.Queue(maxsize=2) if args.window else None
-    overlay_holder: dict | None = None
-    overlay_lock: threading.Lock | None = None
-    if args.battery_interval > 0 and args.window:
-        overlay_lock = threading.Lock()
-        overlay_holder = {"battery_v": None}
-
-    vt = threading.Thread(
-        target=video_receiver,
-        args=(args.host, args.video_port, stop, frame_queue, args.quiet),
-        name="video-tcp",
-        daemon=True,
-    )
-    vt.start()
-
-    disp_t: threading.Thread | None = None
-    if args.window and frame_queue is not None:
-        disp_t = threading.Thread(
-            target=display_loop,
-            args=(frame_queue, stop, overlay_holder, overlay_lock),
-            name="display",
-            daemon=True,
-        )
-        disp_t.start()
+    player_proc = launch_player(player, args.video_transport, args.host, args.video_port, args.quiet)
+    if player != "none" and player_proc is None:
+        return 1
 
     bat_t: threading.Thread | None = None
     if args.battery_interval > 0:
@@ -355,10 +443,6 @@ def main() -> int:
                 stop,
                 args.quiet,
             ),
-            kwargs={
-                "overlay_holder": overlay_holder,
-                "overlay_lock": overlay_lock,
-            },
             name="battery-tcp",
             daemon=True,
         )
@@ -384,28 +468,38 @@ def main() -> int:
     try:
         if args.no_control:
             if not args.quiet:
-                print("Режим только видео. Ctrl+C — выход.", flush=True)
-            while vt.is_alive() and not stop.is_set():
+                print("Режим только видео/player. Ctrl+C — выход.", flush=True)
+            if player_proc is None:
+                return 0
+            while not stop.is_set():
+                if player_proc is not None and player_proc.poll() is not None:
+                    break
                 time.sleep(0.25)
         elif args.stress:
             if not args.quiet:
                 print(
-                    f"Stress управления ~{args.stress_seconds:.0f} с (отдельный поток), видео — параллельно. Ctrl+C — выход.",
+                    f"Stress управления ~{args.stress_seconds:.0f} с (отдельный поток), видео идёт через внешний player. Ctrl+C — выход.",
                     flush=True,
                 )
             if stress_t is not None:
                 stress_t.join(timeout=max(5.0, args.stress_seconds + 3.0))
             if not args.quiet:
                 print("Stress завершён (роботу отправлен stop). Видео продолжается. Ctrl+C — выход.", flush=True)
-            while vt.is_alive() and not stop.is_set():
+            if player_proc is None:
+                return 0
+            while not stop.is_set():
+                if player_proc is not None and player_proc.poll() is not None:
+                    break
                 time.sleep(0.25)
-        elif args.window and args.battery_interval > 0:
+        elif args.battery_interval > 0:
             if not args.quiet:
                 print(
-                    "Видео + напряжение аккумулятора на кадре (отдельное TCP к control). Ctrl+C — выход.",
+                    "Видео через внешний player + напряжение аккумулятора в stdout. Ctrl+C — выход.",
                     flush=True,
                 )
-            while vt.is_alive() and not stop.is_set():
+            while not stop.is_set():
+                if player_proc is not None and player_proc.poll() is not None:
+                    break
                 time.sleep(0.25)
         else:
             control_interactive(args.host, args.control_port, stop, args.quiet)
@@ -413,7 +507,12 @@ def main() -> int:
         stop.set()
     finally:
         stop.set()
-        vt.join(timeout=3.0)
+        if player_proc is not None and player_proc.poll() is None:
+            player_proc.terminate()
+            try:
+                player_proc.wait(timeout=3.0)
+            except subprocess.TimeoutExpired:
+                player_proc.kill()
     return 0
 
 

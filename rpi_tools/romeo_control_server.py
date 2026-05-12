@@ -62,6 +62,7 @@ import json
 import logging
 import socket
 import threading
+from typing import Callable
 from rpi_tools.errors import TcpBindError
 from rpi_tools.config import (
     ROMEO_ADC_DEFAULT_CHANNEL,
@@ -318,25 +319,36 @@ def _process_line(
     read_timeout: float,
     read_idle: float,
     drive_spam_state: dict | None = None,
-) -> tuple[bool, str, str]:
+    camera_control_handler: Callable[[dict], dict | None] | None = None,
+) -> tuple[bool, str, str, dict | None]:
     """
     Возвращает (ok, reply_text, error_message).
     reply_text — сырой ответ Romeo (может быть пустым).
     """
     raw = line.strip()
     if not raw:
-        return True, "", ""
+        return True, "", "", None
 
     cmds: list[str]
     if raw.startswith("{"):
         try:
             obj = json.loads(raw)
         except json.JSONDecodeError as e:
-            return False, "", f"JSON: {e}"
+            return False, "", f"JSON: {e}", None
+        act = str(obj.get("action", "")).strip().lower() if isinstance(obj, dict) else ""
+        if camera_control_handler is not None:
+            try:
+                camera_payload = camera_control_handler(obj)
+            except ValueError as e:
+                return False, "", str(e), None
+            if camera_payload is not None:
+                return True, "", "", camera_payload
+        if act.startswith("camera"):
+            return False, "", "camera-control недоступен в текущем video mode", None
         try:
             cmds = _json_to_romeo_lines(obj, tank_speed, turret_step_default)
         except ValueError as e:
-            return False, "", str(e)
+            return False, "", str(e), None
     else:
         cmds = [raw]
 
@@ -361,7 +373,7 @@ def _process_line(
                 log_send=False,
             )
         except (OSError, RuntimeError) as e:
-            return False, "", str(e)
+            return False, "", str(e), None
         if chunk:
             parts.append(chunk.decode("utf-8", errors="replace"))
         if drive_spam_state is not None:
@@ -369,7 +381,7 @@ def _process_line(
                 drive_spam_state["last_spam"] = spam_key
             else:
                 drive_spam_state["last_spam"] = None
-    return True, "".join(parts), ""
+    return True, "".join(parts), "", None
 
 
 def _control_ok_payload(reply: str) -> dict:
@@ -426,6 +438,7 @@ def _client_loop(
     turret_step_default: int | float | None,
     read_timeout: float,
     read_idle: float,
+    camera_control_handler: Callable[[dict], dict | None] | None = None,
 ) -> None:
     try:
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -446,7 +459,7 @@ def _client_loop(
                     break
                 line = bytes(buf[:i]).decode("utf-8", errors="replace")
                 del buf[: i + 1]
-                ok, reply, err = _process_line(
+                ok, reply, err, extra_payload = _process_line(
                     line,
                     romeo_port=romeo_port,
                     baud=baud,
@@ -456,10 +469,11 @@ def _client_loop(
                     read_timeout=read_timeout,
                     read_idle=read_idle,
                     drive_spam_state=drive_spam_state,
+                    camera_control_handler=camera_control_handler,
                 )
                 lead_delay = 0.0
                 if ok:
-                    rsp = _control_ok_payload(reply)
+                    rsp = extra_payload if extra_payload is not None else _control_ok_payload(reply)
                 else:
                     rsp = {"ok": False, "error": err}
                 conn.sendall((json.dumps(rsp, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -483,6 +497,7 @@ def start_romeo_control_server(
     turret_step_default: int | float | None = None,
     read_timeout: float = 0.45,
     read_idle: float = 0.03,
+    camera_control_handler: Callable[[dict], dict | None] | None = None,
 ) -> tuple[socket.socket, threading.Thread]:
     """
     Слушает TCP ``0.0.0.0:bind_port``; каждое соединение — независимые строки команд.
@@ -538,6 +553,7 @@ def start_romeo_control_server(
                     "turret_step_default": turret_step_default,
                     "read_timeout": read_timeout,
                     "read_idle": read_idle,
+                    "camera_control_handler": camera_control_handler,
                 },
                 daemon=True,
             )

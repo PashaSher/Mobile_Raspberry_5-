@@ -4,7 +4,7 @@
 
 Реализация разнесена по пакету ``rpi_tools/``:
 
-- ``rpi_tools/camera_stream.py`` — камера, MJPEG по TCP, UDP discovery, ``send``.
+- ``rpi_tools/camera_stream.py`` — камера, UDP/H.264, RTSP/H.264 и H.264/TCP пути, legacy JPEG/MJPEG по TCP, UDP discovery, ``send``.
 - ``rpi_tools/romeo_usb.py`` — USB Romeo: прошивка (bootloader), ``serial-send``, ``adc-read`` / ``adc-cal`` (АЦП, VCC/VREF).
 - ``rpi_tools/romeo_control_server.py`` — TCP с ПК → строки на Romeo (при ``send --listen``).
 - ``rpi_tools/wifi_scan.py`` — ``wifi-scan`` (nmcli).
@@ -13,13 +13,16 @@
 
 - ``rpi_tools/boot_gpio_gate.py`` — при старте Pi: если GPIO (BCM) на земле → ``exec`` стрима, иначе выход без запуска (см. ``scripts/camstream-gpio-gate.service.example``).
 
-Документация: клиент на ПК — ``docs/pc-remote-control.ru.md``; качество видео на Pi (JPEG, разрешение) — ``docs/pi-stream-quality.ru.md``.
+Документация: клиент на ПК — ``docs/pc-remote-control.ru.md``; качество видео на Pi (H.264/JPEG, битрейт, разрешение) — ``docs/pi-stream-quality.ru.md``.
 
 Примеры:
 
   python stream_camera.py send --listen
   # При --listen по умолчанию TCP :5001 принимает команды Romeo с ПК (см. --romeo-control-port).
-  python stream_camera.py send --listen --port 5000 --no-set-fps
+  python stream_camera.py send --listen --stream-preset cinema
+  python stream_camera.py send --video-mode udp_h264 --host 10.42.0.2 --port 5000 --stream-preset realtime
+  python stream_camera.py send --ap-ssid 12345 --ap-force --video-mode udp_h264 --host 10.42.0.194 --port 5000 --stream-preset realtime
+  python stream_camera.py send --listen --video-mode jpeg_tcp --port 5000 --no-set-fps
   python stream_camera.py serial-send
   python stream_camera.py romeo
   python stream_camera.py flash-romeo
