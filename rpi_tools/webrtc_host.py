@@ -1,0 +1,472 @@
+"""WebRTC Host на Raspberry Pi: peer connection, video track, Data Channel управления."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import signal
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:
+    from aiortc import RTCIceCandidate, RTCPeerConnection
+
+    from rpi_tools.webrtc_video import H264CameraTrack
+
+from rpi_tools.webrtc_signaling import FirebaseSignaling, init_firebase
+
+log = logging.getLogger("camstream.webrtc")
+
+# Публичный STUN: помогает Windows/Chrome выдать нормальные srflx-кандидаты, не только 127.0.0.1.
+STUN_SERVERS: list[str] = ["stun:stun.l.google.com:19302"]
+
+
+def _pref_video_codec_preferences_for_answer() -> list:
+    """Приоритет H.264 baseline (42001f) — чаще декодируется в Chrome/Edge без «тишины» на приёме."""
+    from aiortc.codecs import get_capabilities
+
+    caps = list(get_capabilities("video").codecs)
+
+    def _pid(c):
+        return (c.parameters or {}).get("profile-level-id", "")
+
+    def _sort_key(c: object) -> tuple:
+        p = _pid(c)
+        if p == "42001f":
+            tier = 0
+        elif p == "42e01f":
+            tier = 1
+        else:
+            tier = 2
+        return (tier, p)
+
+    h264_sorted = sorted(
+        [c for c in caps if getattr(c, "mimeType", "") == "video/H264"],
+        key=_sort_key,
+    )
+    vp8 = [c for c in caps if getattr(c, "name", "") == "VP8"]
+    return [*h264_sorted, *vp8]
+
+
+def _parse_ice_candidate(data: dict) -> RTCIceCandidate | None:
+    """Разбор ICE из JSON браузера (Chrome/Firefox) для aiortc.addIceCandidate.
+
+    Используем candidate_from_sdp из aiortc — корректнее ручного split() для части строк.
+    """
+    from aiortc.sdp import candidate_from_sdp
+
+    raw = data.get("candidate", "")
+    sdp_mid = data.get("sdpMid")
+    sdp_mline_index = data.get("sdpMLineIndex")
+    if not raw or raw == "":
+        return None
+
+    try:
+        candidate = candidate_from_sdp(raw)
+    except Exception as e:
+        log.debug("ICE: разбор через candidate_from_sdp не удался (%s): %.120s…", e, raw)
+        return None
+
+    candidate.sdpMid = sdp_mid
+    candidate.sdpMLineIndex = sdp_mline_index
+
+    ip = candidate.ip or ""
+    try:
+        port = int(candidate.port)
+    except (TypeError, ValueError):
+        return None
+
+    if ip.startswith("169.254."):
+        log.debug("ICE: пропуск link-local кандидата %s:%s", ip, port)
+        return None
+    if port == 9:
+        log.debug("ICE: пропуск порта 9 для %s", ip)
+        return None
+
+    return candidate
+
+
+class WebRTCHost:
+    """
+    Main WebRTC host: creates peer connection, attaches H.264 video,
+    handles Data Channel commands for Romeo and camera control.
+    """
+
+    def __init__(
+        self,
+        firebase_cred: str,
+        firebase_db_url: str,
+        room_id: str,
+        width: int = 1280,
+        height: int = 720,
+        fps: float = 30.0,
+        bitrate: int = 4_000_000,
+        intra: int = 30,
+        profile: str | None = "baseline",
+        camera_extra_args: list[str] | None = None,
+        command_handler: Callable[[dict], dict] | None = None,
+    ) -> None:
+        self._firebase_cred = firebase_cred
+        self._firebase_db_url = firebase_db_url
+        self._room_id = room_id
+        self._command_handler = command_handler
+
+        self._video_width = width
+        self._video_height = height
+        self._video_fps = fps
+        self._video_bitrate = bitrate
+        self._video_intra = intra
+        self._video_profile = profile
+        self._camera_extra_args = camera_extra_args
+
+        self._video_track: H264CameraTrack | None = None
+        self._pc: RTCPeerConnection | None = None
+        self._signaling: FirebaseSignaling | None = None
+        self._running = False
+
+    async def run(self) -> None:
+        """Main loop: create room, wait for offer, connect, stream."""
+        init_firebase(self._firebase_cred, self._firebase_db_url)
+        log.info(
+            "WebRTC: signaling в Firebase только в /rooms/%s/ … "
+            "Имя комнаты ДОЛЖНО быть тем же во всём коде браузера (иначе offer уйдёт «в другую» комнату, answer не вернётся).",
+            self._room_id,
+        )
+        self._running = True
+        self._prev_ufrag: str | None = None
+
+        while self._running:
+            try:
+                await self._session()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                log.exception("WebRTC session error")
+            finally:
+                await self._cleanup_session()
+
+            if self._running:
+                log.info("WebRTC: session ended, restarting in 2s...")
+                await asyncio.sleep(2.0)
+
+    async def _session(self) -> None:
+        self._signaling = FirebaseSignaling(self._room_id)
+        await self._signaling.create_room(clear_offer=self._prev_ufrag is not None)
+
+        offer_data = await self._signaling.wait_for_offer(
+            prev_ufrag=self._prev_ufrag
+        )
+        self._prev_ufrag = self._signaling.last_ufrag
+
+        from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+
+        from rpi_tools.webrtc_video import H264CameraTrack
+
+        ice_servers = [RTCIceServer(urls=s) for s in STUN_SERVERS] if STUN_SERVERS else []
+        config = RTCConfiguration(iceServers=ice_servers)
+        self._pc = RTCPeerConnection(configuration=config)
+        log.info("WebRTC: peer connection created")
+
+        v_tx = self._pc.addTransceiver("video", direction="sendrecv")
+        try:
+            prefs = _pref_video_codec_preferences_for_answer()
+            if prefs:
+                v_tx.setCodecPreferences(prefs)
+                log.info(
+                    "WebRTC: setCodecPreferences до setRemote (H264 profile-level-id): %s",
+                    [
+                        (c.parameters or {}).get("profile-level-id", "?")
+                        for c in prefs
+                        if getattr(c, "mimeType", "") == "video/H264"
+                    ]
+                    or "?",
+                )
+        except Exception as exc:
+            log.warning("WebRTC: setCodecPreferences (video): %s", exc)
+
+        def _wire_data_channel(channel) -> None:
+            @channel.on("open")
+            def on_open():
+                log.info("WebRTC: Data Channel %r открыт (готов к JSON-командам)", channel.label)
+
+            @channel.on("message")
+            def on_msg(msg):
+                self._handle_data_channel_message(channel, msg)
+
+        @self._pc.on("datachannel")
+        def on_datachannel(channel):
+            log.info("WebRTC: Data Channel от клиента label=%r", channel.label)
+            _wire_data_channel(channel)
+
+        @self._pc.on("connectionstatechange")
+        async def on_connection_state_change():
+            state = self._pc.connectionState
+            log.info("WebRTC: connection state -> %s", state)
+            if state == "connected":
+                await self._signaling.set_status("connected")
+            elif state in ("failed", "closed", "disconnected"):
+                await self._signaling.set_status("closed")
+
+        @self._pc.on("iceconnectionstatechange")
+        async def on_ice_state():
+            log.info("WebRTC: ICE state -> %s", self._pc.iceConnectionState)
+
+        @self._pc.on("icecandidate")
+        async def on_ice_candidate(candidate):
+            if candidate and self._signaling:
+                await self._signaling.send_ice_candidate({
+                    "candidate": candidate.to_sdp(),
+                    "sdpMid": candidate.sdpMid,
+                    "sdpMLineIndex": candidate.sdpMLineIndex,
+                })
+
+        offer = RTCSessionDescription(
+            sdp=offer_data["sdp"],
+            type=offer_data.get("type", "offer"),
+        )
+        await self._pc.setRemoteDescription(offer)
+        log.info("WebRTC: remote description set")
+
+        # В offer нет m=application — браузер не поднял SCTP; создаём канал с Pi (часть старых страниц).
+        offer_sdp = offer_data.get("sdp", "")
+        if "m=application" not in offer_sdp.lower():
+            try:
+                dc_pi = self._pc.createDataChannel("romeo", ordered=True)
+                _wire_data_channel(dc_pi)
+                log.info(
+                    "WebRTC: в SDP не было SCTP — создан исходящий DataChannel %r со стороны Pi",
+                    dc_pi.label,
+                )
+            except Exception as ex:
+                log.warning("WebRTC: не удалось создать DataChannel на Pi: %s", ex)
+
+        seen_candidates: set[str] = set()
+
+        def _add_candidate(candidate_data: dict) -> None:
+            key = candidate_data.get("candidate", "")
+            if key in seen_candidates:
+                return
+            seen_candidates.add(key)
+            candidate = _parse_ice_candidate(candidate_data)
+            if candidate and self._pc:
+                log.info("WebRTC: adding remote ICE candidate %s:%s",
+                         candidate.ip, candidate.port)
+                asyncio.ensure_future(self._pc.addIceCandidate(candidate))
+
+        existing = await self._signaling.poll_remote_candidates()
+        for c_data in existing:
+            _add_candidate(c_data)
+        if existing:
+            log.info("WebRTC: loaded %d existing ICE candidates", len(existing))
+
+        self._signaling.listen_remote_candidates(_add_candidate)
+
+        self._video_track = H264CameraTrack(
+            width=self._video_width,
+            height=self._video_height,
+            fps=self._video_fps,
+            bitrate=self._video_bitrate,
+            intra=self._video_intra,
+            profile=self._video_profile,
+            camera_extra_args=self._camera_extra_args,
+        )
+        try:
+            self._video_track.start_source()
+            log.info(
+                "WebRTC: rpicam/камера запущены до SDP answer (быстрее первый RTP)"
+            )
+        except Exception as ex:
+            log.error(
+                "WebRTC: не удалось запустить камеру до answer: %s. "
+                "Проверьте rpicam-vid / libcamera-vid и доступ к камере.",
+                ex,
+            )
+            raise
+
+        v_tx.sender.replaceTrack(self._video_track)
+        log.info(
+            "WebRTC: H.264-трек привязан к трансоверу (replaceTrack) перед createAnswer"
+        )
+
+        answer = await self._pc.createAnswer()
+        await self._pc.setLocalDescription(answer)
+        log.info("WebRTC: local description set (answer)")
+        try:
+            for t in self._pc.getTransceivers():
+                if t.kind != "video" or not getattr(t.sender, "track", None):
+                    continue
+                cdx = getattr(t, "_codecs", None) or ()
+                names = []
+                for c in cdx[:6]:
+                    n = getattr(c, "name", None) or str(c)
+                    names.append(n)
+                log.info(
+                    "WebRTC: видеотрансовер направление=%s согласованные кодеки: %s",
+                    getattr(t, "direction", "?"),
+                    names or "?",
+                )
+        except Exception as ex:
+            log.debug("WebRTC: лог кодеков: %s", ex)
+
+        await self._signaling.send_answer({
+            "sdp": self._pc.localDescription.sdp,
+            "type": self._pc.localDescription.type,
+        })
+
+        async def _poll_and_signal_eoc() -> None:
+            """Poll for late candidates, then signal end-of-candidates."""
+            for _ in range(5):
+                await asyncio.sleep(1.0)
+                if not self._pc or self._pc.connectionState == "connected":
+                    return
+                candidates = await self._signaling.poll_remote_candidates()
+                for c_data in candidates:
+                    _add_candidate(c_data)
+
+            if self._pc and self._pc.connectionState != "connected":
+                log.info("WebRTC: signaling end-of-candidates")
+                try:
+                    await self._pc.addIceCandidate(None)
+                except Exception:
+                    log.debug("WebRTC: addIceCandidate(None) not supported, skipping")
+
+        poll_task = asyncio.ensure_future(_poll_and_signal_eoc())
+
+        deadline = asyncio.get_event_loop().time() + 30.0
+        while self._running and self._pc:
+            state = self._pc.connectionState
+            if state in ("failed", "closed"):
+                log.info("WebRTC: connection %s — ending session", state)
+                break
+            if state == "connected":
+                break
+            if asyncio.get_event_loop().time() > deadline:
+                log.warning("WebRTC: ICE timeout (30s) — ending session")
+                break
+            await asyncio.sleep(0.3)
+
+        poll_task.cancel()
+
+        if self._pc and self._pc.connectionState == "connected":
+            log.info("WebRTC: streaming active, waiting for disconnect...")
+            while self._running and self._pc and self._pc.connectionState == "connected":
+                await asyncio.sleep(1.0)
+
+    def _handle_data_channel_message(self, channel, message: str | bytes) -> None:
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", errors="replace")
+
+        text = message.strip()
+        if not text:
+            return
+
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            obj = {"romeo": text}
+
+        response: dict
+        if self._command_handler:
+            try:
+                response = self._command_handler(obj)
+            except Exception as e:
+                response = {"ok": False, "error": str(e)}
+        else:
+            response = {"ok": False, "error": "no command handler configured"}
+
+        if channel and channel.readyState == "open":
+            try:
+                channel.send(json.dumps(response, ensure_ascii=False))
+            except Exception:
+                log.debug("WebRTC: failed to send DC response")
+
+    async def _cleanup_session(self) -> None:
+        if self._video_track:
+            self._video_track.stop()
+            self._video_track = None
+        self._kill_stale_rpicam()
+        if self._pc:
+            try:
+                await self._pc.close()
+            except Exception:
+                pass
+            self._pc = None
+        if self._signaling:
+            try:
+                await self._signaling.cleanup()
+            except Exception:
+                pass
+            self._signaling = None
+
+    @staticmethod
+    def _kill_stale_rpicam() -> None:
+        """Kill any leftover rpicam-vid processes to free the camera."""
+        import subprocess as _sp
+        try:
+            _sp.run(["pkill", "-f", "rpicam-vid"], capture_output=True, timeout=3)
+        except Exception:
+            pass
+
+    def request_stop(self) -> None:
+        self._running = False
+
+
+async def run_webrtc_host(
+    firebase_cred: str,
+    firebase_db_url: str,
+    room_id: str,
+    width: int = 1280,
+    height: int = 720,
+    fps: float = 30.0,
+    bitrate: int = 4_000_000,
+    intra: int = 30,
+    profile: str | None = "baseline",
+    camera_extra_args: list[str] | None = None,
+    command_handler: Callable[[dict], dict] | None = None,
+) -> None:
+    """Entry point: run WebRTC host until interrupted."""
+    try:
+        import aiortc as _aiortc  # noqa: F401
+        import av as _av  # noqa: F401
+        del _aiortc, _av
+    except ModuleNotFoundError as e:
+        log.error(
+            "Не установлен пакет aiortc (обычно вместе с PyAV/av). "
+            "В этом же интерпретаторе: pip install aiortc av или pip install -r requirements.txt "
+            "(см. %s).",
+            e,
+        )
+        raise SystemExit(1) from e
+
+    host = WebRTCHost(
+        firebase_cred=firebase_cred,
+        firebase_db_url=firebase_db_url,
+        room_id=room_id,
+        width=width, height=height, fps=fps,
+        bitrate=bitrate, intra=intra, profile=profile,
+        camera_extra_args=camera_extra_args,
+        command_handler=command_handler,
+    )
+
+    loop = asyncio.get_event_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        log.info("WebRTC: stop signal received")
+        host.request_stop()
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except NotImplementedError:
+            pass
+
+    try:
+        await host.run()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.remove_signal_handler(sig)
+            except NotImplementedError:
+                pass

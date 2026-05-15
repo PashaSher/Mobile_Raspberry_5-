@@ -1,0 +1,26 @@
+WebRTC signalling: использовать комнату rooms/pi-camera
+=====================================================
+
+На Raspberry Pi по умолчанию уже так:
+  stream_camera.py webrtc … --firebase-cred … --firebase-db-url …
+(--room можно не указывать, это pi-camera.)
+
+На ПК в Romeo WebRTC Operator (webrtc-client.html и т.п.):
+
+1. Найти в коде переменную с именем комнаты (раньше было pi-cam-2 или другое).
+2. Задать строку именно pi-camera либо подключить сначала:
+     examples/rtdb_room_pi_camera.js
+   и везде использовать window.__RTDB_WEBRTC_ROOM_ID.
+
+3. В Firebase Console открыть только Realtime Database → Data → rooms → pi-camera
+   (старую комнату pi-cam-2 можно удалить, чтобы не путаться.)
+
+Проверить совпадение: в браузере offer должен появляться под
+  rooms → pi-camera → offer
+рядом с status = waiting, который пишет Pi.
+
+Если «подключилось», но нет видео/управления:
+- На странице должен быть video.srcObject = inbound stream и ontrack должен навешивать поток на <video>.
+- Data Channel на стороне ПК должен отправлять JSON в канал того же имени («romeo» / тот же label, что создаётся до createOffer у клиента).
+
+На Pi см. профиль --video-profile (по умолчанию main) и лог мы «согласованные кодеки» после answer.

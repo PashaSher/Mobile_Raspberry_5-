@@ -2,28 +2,25 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "RPI: hotspot udp_h264",
+      "name": "RPI: debug (webrtc + firebase)",
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/stream_camera.py",
+      "python": "${workspaceFolder}/.venv/bin/python",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "args": [
-        "send",
-        "--video-mode",
-        "udp_h264",
-        "--ap-ssid",
-        "12345",
-        "--ap-force",
-        "--host",
-        "10.42.0.194",
-        "--port",
-        "5000",
-        "--stream-preset",
-        "realtime"
+        "-v",
+        "webrtc",
+        "--firebase-cred",
+        "${workspaceFolder}/bro-oppy-firebase-adminsdk-fbsvc-08c5f0ddfe.json",
+        "--firebase-db-url",
+        "https://bro-oppy-default-rtdb.firebaseio.com",
+        "--room",
+        "pi-camera"
       ],
-      "justMyCode": true,
-      "preLaunchTask": "free-camstream-debug-ports"
+      "justMyCode": false,
+      "preLaunchTask": "webrtc-debug-prep"
     }
   ]
 }

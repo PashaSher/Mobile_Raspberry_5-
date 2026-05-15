@@ -1,0 +1,1 @@
+Enhance camera streaming capabilities in stream_camera.py by adding support for UDP/H.264, RTSP/H.264, and legacy JPEG/MJPEG over TCP. Update CLI options for video modes and presets, refine documentation for improved clarity on streaming configurations, and enhance discovery protocol to include video transport details. Update launch configurations in VSCode for better usability.

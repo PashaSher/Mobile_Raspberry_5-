@@ -6,7 +6,10 @@ simplejpeg>=1.7.1
 # CSI / libcamera: sudo apt install -y python3-libcamera libcap2-dev && pip install picamera2
 # Автозапуск по GPIO (boot_gpio_gate): pip install gpiozero
 gpiozero>=2.0.0
-# Romeo USB / serial-send / TCP→USB / LTG heartbeat (rpi_tools/romeo_usb.py)
-pyserial>=3.5
+# WebRTC signaling (webrtc) + firebase-probe
+firebase-admin>=6.5.0
+# WebRTC медиа-треки (webrtc_host, webrtc_video)
+aiortc>=1.9.0
+av>=12.0.0
 # Автозапуск с ожиданием отладчика (scripts/camstream-gpio-gate-debug.service.example)
 debugpy>=1.8.0

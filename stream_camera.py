@@ -26,6 +26,9 @@
   python stream_camera.py serial-send
   python stream_camera.py romeo
   python stream_camera.py flash-romeo
+  python stream_camera.py firebase-probe --firebase-cred bro-oppy-firebase-adminsdk-fbsvc-….json
+  python stream_camera.py webrtc --firebase-cred … --firebase-db-url https://PROJECT-default-rtdb.firebaseio.com
+  # Комната RTDB для WebRTC по умолчанию: pi-camera (см. examples/WEBRTC_ROOM_pi-camera.txt и examples/rtdb_room_pi_camera.js)
   python stream_camera.py wifi-scan
   python stream_camera.py wifi-connect "ИмяСети" --password-file ~/wifi.key
   # или: export RPI_WIFI_PASSWORD='...' && python stream_camera.py wifi-connect "ИмяСети"
@@ -41,10 +44,18 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
 from rpi_tools.cli import main
 from rpi_tools.config import ROMEO_USB_PORT
 
 __all__ = ["main", "ROMEO_USB_PORT"]
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    _rc = main()
+    if _rc:
+        # os._exit: без SystemExit — иначе debugpy на Python 3.13 часто даёт IndexError в traceback.format
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(int(_rc))

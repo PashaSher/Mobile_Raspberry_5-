@@ -3,6 +3,13 @@ config/wifi.local.env
 # Пароль точки доступа (копия с ap.local.env.example)
 config/ap.local.env
 
+# Firebase Admin SDK credentials (NEVER commit)
+*-firebase-adminsdk-*.json
+serviceAccountKey.json
+
+# Локальный env для отладки WebRTC/Firebase (копия с config/firebase.debug.env.example)
+config/firebase.debug.env
+
 .venv/
 __pycache__/
 *.py[cod]

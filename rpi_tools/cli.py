@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 from rpi_tools.camera_stream import _default_capture_mode, run_send
 from rpi_tools.errors import TcpBindError
@@ -37,6 +38,57 @@ from rpi_tools.wifi_scan import run_wifi_scan
 
 log = logging.getLogger("camstream")
 
+_FIREBASE_ENV_HINT_RU = (
+    "Подставить пути из переменных окружения не удалось (часто пустой результат от ${env:…} при отладке). "
+    "Создайте config/firebase.debug.env из config/firebase.debug.env.example "
+    "(или выполните scripts/ensure_firebase_debug_env.sh) и выберите в launch.json envFile этот файл."
+)
+
+
+def _firebase_cred_existing_path(raw: str) -> str:
+    """Не пустая строка, файл JSON ключа Firebase существует."""
+    s = (raw or "").strip()
+    if not s:
+        raise argparse.ArgumentTypeError(
+            "--firebase-cred не может быть пустым.\n"
+            + _FIREBASE_ENV_HINT_RU
+        )
+    path = Path(s).expanduser()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"Файл ключа не найден или не файл: {path}")
+    return str(path.resolve())
+
+
+def _firebase_rtdb_url(raw: str) -> str:
+    u = (raw or "").strip()
+    if not u:
+        raise argparse.ArgumentTypeError(
+            "--firebase-db-url не может быть пустым.\n" + _FIREBASE_ENV_HINT_RU
+        )
+    low = u.lower()
+    if not low.startswith("https://"):
+        raise argparse.ArgumentTypeError("URL базы данных должен начинаться с https://")
+    if "firestore.googleapis.com" in low or "firebasestorage.googleapis.com" in low:
+        raise argparse.ArgumentTypeError(
+            "Похоже на Firestore или Storage URL; для WebRTC нужен Realtime Database."
+        )
+    if "firebaseio.com" not in low and "firebasedatabase.app" not in low:
+        raise argparse.ArgumentTypeError(
+            "Ожидается узел вида *.firebaseio.com или *.firebasedatabase.app "
+            "(Realtime Database)."
+        )
+    return u.rstrip("/")
+
+
+def _webrtc_room_non_empty(raw: str) -> str:
+    rid = (raw or "").strip()
+    if not rid:
+        raise argparse.ArgumentTypeError(
+            "--room не может быть пустым "
+            '(пустая строка сбросит имя комнаты; omit --room и будет "pi-camera").'
+        )
+    return rid
+
 
 def _print_hotspot_blocked_hint() -> None:
     print(
@@ -48,8 +100,52 @@ def _print_hotspot_blocked_hint() -> None:
     )
 
 
+class ArgparseCliExit(Exception):
+    """Подмена argparse exit(): не вызывать sys.exit (ломает отладчик/pydevd на Python 3.13)."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: int | None = 0) -> None:
+        self.code = code
+
+
+class CamstreamArgumentParser(argparse.ArgumentParser):
+    """Все подкоманды с exit_on_error=False; help/ошибки через ArgparseCliExit или ArgumentError."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("exit_on_error", False)
+        super().__init__(*args, **kwargs)
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:  # noqa: A003 (argparse API)
+        if message:
+            self._print_message(message, sys.stderr)
+        raise ArgparseCliExit(status)
+
+
+def _print_usage_chain_for_cli_error(main_parser: argparse.ArgumentParser, argv: list[str]) -> None:
+    """Как «usage» в stderr у argparse.error, плюс usage подкоманды по argv (если нашли)."""
+    main_parser.print_usage(sys.stderr)
+    sub_action = None
+    for action in getattr(main_parser, "_actions", []):
+        if action.__class__.__name__ == "_SubParsersAction":
+            sub_action = action
+            break
+    if sub_action is None:
+        return
+    name_map = getattr(sub_action, "_name_parser_map", {})
+    for tok in argv[1:]:
+        if tok.startswith("-"):
+            continue
+        if tok in name_map:
+            try:
+                name_map[tok].print_usage(sys.stderr)
+            except Exception:
+                pass
+            break
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(
+    parser = CamstreamArgumentParser(
         description="Raspberry Pi: камера (H.264/TCP/UDP + legacy JPEG/TCP + UDP discovery), Romeo USB, Wi‑Fi, прошивка"
     )
     parser.add_argument(
@@ -594,10 +690,160 @@ def main() -> int:
         help="Пауза после открытия порта до первой команды",
     )
 
-    args = parser.parse_args()
+    p_webrtc = sub.add_parser(
+        "webrtc",
+        help="WebRTC Host: H.264 видео + Data Channel управление через Firebase signaling",
+    )
+    p_webrtc.add_argument(
+        "--firebase-cred",
+        required=True,
+        metavar="PATH",
+        type=_firebase_cred_existing_path,
+        help="Путь к serviceAccountKey.json от Firebase",
+    )
+    p_webrtc.add_argument(
+        "--firebase-db-url",
+        required=True,
+        metavar="URL",
+        type=_firebase_rtdb_url,
+        help=(
+            "URL Firebase Realtime Database, "
+            "например https://<id>-default-rtdb.firebaseio.com (подобрать: команда firebase-probe)"
+        ),
+    )
+    p_webrtc.add_argument(
+        "--room",
+        default="pi-camera",
+        metavar="ID",
+        type=_webrtc_room_non_empty,
+        help=(
+            "Имя комнаты в RTDB (/rooms/<id>/). То же строкой в HTML оператора; "
+            "если браузер пишет в pi-cam-2 — запуск: --room pi-cam-2"
+        ),
+    )
+    p_webrtc.add_argument("--width", type=int, default=1280, help="Ширина кадра (по умолчанию 1280)")
+    p_webrtc.add_argument("--height", type=int, default=720, help="Высота кадра (по умолчанию 720)")
+    p_webrtc.add_argument("--fps", type=float, default=30.0, help="FPS (по умолчанию 30)")
+    p_webrtc.add_argument(
+        "--video-bitrate",
+        type=int,
+        default=4_000_000,
+        metavar="BPS",
+        help="Битрейт H.264 в бит/с (по умолчанию 4000000 = 4 Мбит/с)",
+    )
+    p_webrtc.add_argument(
+        "--video-intra",
+        type=int,
+        default=30,
+        metavar="N",
+        help="Интервал I-frame / IDR (по умолчанию 30)",
+    )
+    p_webrtc.add_argument(
+        "--video-profile",
+        choices=["baseline", "main", "high"],
+        default="baseline",
+        help=(
+            "H.264 профиль для rpicam перед RTP (по умолчанию baseline — лучше с декодерами браузера)"
+        ),
+    )
+    p_webrtc.add_argument(
+        "--romeo-usb",
+        default=None,
+        metavar="DEV",
+        help=f"USB CDC Romeo (по умолчанию {ROMEO_USB_PORT})",
+    )
+    p_webrtc.add_argument("--romeo-baud", type=int, default=115200, help="Скорость UART Romeo")
+    p_webrtc.add_argument(
+        "--romeo-tank-speed",
+        type=int,
+        default=ROMEO_TANK_SPEED_DEFAULT,
+        metavar="N",
+        help="Базовый модуль для JSON drive left/right",
+    )
+    p_webrtc.add_argument(
+        "--romeo-turret-step",
+        type=int,
+        default=None,
+        metavar="DEG",
+        help="Шаг башни по умолчанию для action=turret",
+    )
+    p_webrtc.add_argument(
+        "--room-only",
+        action="store_true",
+        dest="webrtc_room_only",
+        help=(
+            "Только записать в RTDB /rooms/<--room>/status=waiting и выйти "
+            "(без камеры и aiortc; проверить cred и --firebase-db-url на Pi)"
+        ),
+    )
+    # Глобальный -v задаётся *до* подкоманды; дубль здесь — чтобы работало ``webrtc … -v`` (типично в Run/Debug).
+    p_webrtc.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        dest="webrtc_verbose",
+        help=(
+            "Усилить логирование до DEBUG (суммируется с общим ``-v``, если он перед webrtc)"
+        ),
+    )
+
+    p_fb_probe = sub.add_parser(
+        "firebase-probe",
+        help="Подобрать Firebase Realtime Database URL и проверить запись в rooms/<id> (диагностика WebRTC signaling)",
+    )
+    p_fb_probe.add_argument(
+        "--firebase-cred",
+        required=True,
+        metavar="PATH",
+        dest="firebase_cred_probe",
+        type=_firebase_cred_existing_path,
+        help="serviceAccountKey.json (тот же файл, что для webrtc)",
+    )
+    p_fb_probe.add_argument(
+        "--room",
+        default="pi-camera",
+        metavar="ID",
+        dest="firebase_room_probe",
+        help="Имя комнаты для тестовой записи (по умолчанию pi-camera)",
+    )
+    p_fb_probe.add_argument(
+        "--firebase-db-url",
+        default=None,
+        metavar="URL",
+        dest="firebase_db_url_override",
+        help="Проверить только этот URL (без перебора регионов)",
+    )
+
+    try:
+        args = parser.parse_args()
+    except ArgparseCliExit as cli_ex:
+        c = cli_ex.code
+        if c is None:
+            return 0
+        if isinstance(c, int):
+            return c
+        return 1
+    except argparse.ArgumentError as exc:
+        _print_usage_chain_for_cli_error(parser, sys.argv)
+        print(f"{parser.prog}: error: {exc}\n", file=sys.stderr, end="")
+        return 2
+
     if args.cmd == "send":
         apply_stream_preset(args)
-    level = logging.DEBUG if args.verbose else getattr(logging, args.log_level)
+
+    # Ранняя диагностика без лишних строк camstream INFO
+    if args.cmd == "firebase-probe":
+        from rpi_tools.firebase_probe import run_firebase_rtdb_probe
+
+        return run_firebase_rtdb_probe(
+            args.firebase_cred_probe,
+            args.firebase_room_probe,
+            database_url_override=args.firebase_db_url_override,
+        )
+
+    _vv = args.verbose + getattr(args, "webrtc_verbose", 0)
+    level = logging.DEBUG if _vv else getattr(logging, args.log_level)
     setup_logging(level)
     log.info("camstream: команда=%s, уровень логов=%s", args.cmd, logging.getLevelName(level))
 
@@ -684,6 +930,109 @@ def main() -> int:
             args.read_idle,
             args.open_delay,
         )
+        return 0
+
+    if args.cmd == "webrtc":
+        import asyncio
+
+        if args.webrtc_room_only:
+
+            async def _webrtc_room_only() -> None:
+                from rpi_tools.webrtc_signaling import FirebaseSignaling, init_firebase
+
+                init_firebase(args.firebase_cred, args.firebase_db_url)
+                await FirebaseSignaling(args.room).create_room()
+
+            try:
+                asyncio.run(_webrtc_room_only())
+            except Exception:
+                log.exception(
+                    "webrtc --room-only: запись комнаты не удалась "
+                    "(см. выше; сравните URL с результатом firebase-probe)"
+                )
+                return 1
+            log.info(
+                "webrtc --room-only: ок. В Firebase Console откройте Realtime Database и узел rooms/%s",
+                args.room,
+            )
+            return 0
+
+        try:
+            from rpi_tools.camera_stream import _CameraControlState, _make_camera_control_handler
+            from rpi_tools.webrtc_host import run_webrtc_host
+            from rpi_tools.romeo_usb import romeo_exchange
+        except ModuleNotFoundError as e:
+            mod = getattr(e, "name", "") or ""
+            pip_hint = "`pip install -r requirements.txt` — полный список для Pi/WebRTC/Firebase."
+            if mod == "firebase_admin":
+                pip_hint = (
+                    "`pip install firebase-admin` (пакет импортируется как firebase_admin) "
+                    "или `pip install -r requirements.txt`."
+                )
+            elif mod in ("aiortc", "av"):
+                pip_hint = "`pip install aiortc av` или `pip install -r requirements.txt`."
+            log.error(
+                "Для режима «webrtc» не установлен модуль %r (%s). "
+                "Выберите интерпретатор того venv, где стоят зависимости (часто ./.venv/bin/python), затем: %s",
+                mod,
+                e,
+                pip_hint,
+            )
+            print(
+                "camstream: нет модуля для webrtc. В Cursor: выберите интерпретатор .venv проекта "
+                "и выполните: pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            return 1
+
+        camera_state = _CameraControlState()
+        camera_handler = _make_camera_control_handler(camera_state)
+
+        romeo_usb = args.romeo_usb or ROMEO_USB_PORT
+        romeo_baud = args.romeo_baud
+        tank_speed = args.romeo_tank_speed
+        turret_step = args.romeo_turret_step
+
+        def _webrtc_command_handler(obj: dict) -> dict:
+            cam_result = camera_handler(obj)
+            if cam_result is not None:
+                return cam_result
+            from rpi_tools.romeo_control_server import _json_to_romeo_lines
+            try:
+                lines = _json_to_romeo_lines(obj, tank_speed, turret_step)
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            parts: list[str] = []
+            for cmd_line in lines:
+                try:
+                    chunk = romeo_exchange(
+                        romeo_usb, romeo_baud, cmd_line,
+                        append_lf=True, read_timeout=0.45, read_idle=0.03,
+                    )
+                    if chunk:
+                        parts.append(chunk.decode("utf-8", errors="replace"))
+                except (OSError, RuntimeError) as e:
+                    return {"ok": False, "error": str(e)}
+            return {"ok": True, "reply": "".join(parts)}
+
+        camera_extra = camera_state.build_rpicam_args()
+
+        try:
+            asyncio.run(run_webrtc_host(
+                firebase_cred=args.firebase_cred,
+                firebase_db_url=args.firebase_db_url,
+                room_id=args.room,
+                width=args.width,
+                height=args.height,
+                fps=args.fps,
+                bitrate=args.video_bitrate,
+                intra=args.video_intra,
+                profile=args.video_profile,
+                camera_extra_args=camera_extra,
+                command_handler=_webrtc_command_handler,
+            ))
+        except KeyboardInterrupt:
+            log.info("webrtc: остановка по Ctrl+C")
         return 0
 
     if args.cmd == "send":

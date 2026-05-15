@@ -139,6 +139,42 @@ HOME
 
 Для UI на ПК используйте `battery_v`, а не сырой ADC код.
 
+## 6а. Отладка: видео + control с одного места
+
+1. На **Pi** для **видео** в режиме `udp_h264`: **`--video-mode udp_h264 --host <IP_этого_ПК> --port 5000` без `--listen`** (слушает ПК локально UDP 5000, Pi шлёт поток на ПК).
+2. **Control** при этом живёт на **том же процессе** `send`: **TCP на Pi**, порт **`5001`** (если не задан `--romeo-control-port 0`). ПК подключается к **`IP_Pi:5001`** (в hotspot это часто **`10.42.0.1:5001`**).
+3. Режим **`--listen`** на Pi нужен другим режимам видео (например H.264/TCP); с **`udp_h264` его нельзя** — программа это запретит.
+
+Пример на **Pi** (ПК получил по DHCP `10.42.0.194` после подключения к AP Pi):
+
+```bash
+python stream_camera.py send --ap-ssid 12345 --ap-force \
+  --video-mode udp_h264 --host 10.42.0.194 --port 5000 --stream-preset realtime
+```
+
+С **ПК** (нужны GStreamer и Python 3):
+
+```bash
+python3 examples/pc_parallel_client.py --host <IP_Pi> --diagnose
+```
+
+Если строка `[diagnose] OK PING` есть — управление живо. Если `FAIL TCP control` — Pi не слушает `5001` или неверный IP.
+
+Полный запуск окна видео + интерактив `control>`:
+
+```bash
+python3 examples/pc_parallel_client.py --host <IP_Pi> --video-transport udp --video-port 5000 --control-port 5001
+```
+
+Hotspot: **IP Pi** для control — **`10.42.0.1`**; в команду **`send`** на Pi в **`--host` подставляйте IP ПК** (`ipconfig` / `ip addr`, часто **`10.42.0.x`**), иначе UDP-видео на ПК не придёт.
+
+Тестовые строки в `control>`:
+
+- `MF` затем `MS`
+- `{"romeo":"PING"}`
+- `{"action":"turret_smooth","dir":"left"}` затем `{"action":"turret_stop"}`
+- см. секцию 6 по клавиатуре для реального приложения.
+
 ## 6. Практика для клавиатуры
 
 - Для моторов: на `keydown` шлите одну команду движения, на `keyup` шлите `stop`.

@@ -9,6 +9,7 @@
 Примеры:
 
   python3 examples/pc_parallel_client.py --host 192.168.1.50
+  python3 examples/pc_parallel_client.py --host 10.42.0.1 --diagnose
   python3 examples/pc_parallel_client.py --host 192.168.1.50 --video-transport udp
   python3 examples/pc_parallel_client.py --host 192.168.1.50 --player vlc
   python3 examples/pc_parallel_client.py --host 192.168.1.50 --video-transport rtp --player gstreamer
@@ -390,6 +391,72 @@ def battery_sampler(
             pass
 
 
+def run_diagnose(host: str, video_port: int, control_port: int, transport: str) -> int:
+    """Проверка TCP на control (+ опционально видео) и один тестовый JSON без запуска плеера."""
+    tag = "diagnose"
+    rc = 0
+    gst = _gstreamer_binary()
+
+    print(f"[{tag}] Pi {host}: control TCP {control_port}, видео {transport.upper()} порт {video_port}")
+
+    print(f"[{tag}] проверка control {host}:{control_port} …", flush=True)
+    try:
+        s = socket.create_connection((host, control_port), timeout=5)
+    except OSError as e:
+        print(f"[{tag}] FAIL TCP control: {e}", file=sys.stderr, flush=True)
+        print(f"[{tag}] На Pi нужны `send ... --listen` и порт Romeo control (чаще 5001, не `--romeo-control-port 0`).", file=sys.stderr, flush=True)
+        return 2
+    buf = bytearray()
+    try:
+        s.sendall(b'{"romeo":"PING"}\n')
+        obj, closed = _read_json_line(s, buf, time.monotonic() + 4.0)
+        if closed or obj is None:
+            print(f"[{tag}] WARN: нет NDJSON ответа на PING (таймаут или не тот порт сервиса).", file=sys.stderr, flush=True)
+            rc = 1
+        else:
+            ok = obj.get("ok")
+            reply = obj.get("reply", "")
+            print(f"[{tag}] OK PING ответ ok={ok!r}, reply_first_line={repr(reply)[:120]}", flush=True)
+    finally:
+        s.close()
+
+    if transport == "tcp":
+        print(f"[{tag}] проверка видео TCP {host}:{video_port} …", flush=True)
+        try:
+            v = socket.create_connection((host, video_port), timeout=5)
+            v.close()
+            print(f"[{tag}] OK: сокет видео открылся (Pi уже слушает или есть что-то на порту).", flush=True)
+        except OSError as e:
+            print(f"[{tag}] WARN видео TCP: {e}", file=sys.stderr, flush=True)
+            print(f"[{tag}] Запуск на Pi должен включать режим клиента видео к ПК или `h264_tcp` `--listen`.", file=sys.stderr, flush=True)
+            rc = max(rc, 1)
+    else:
+        print(
+            f"[{tag}] Видео {transport.upper()}: на ЭТОМ ПК локально слушайте udp port={video_port} ( Gst / helper ниже ).",
+            flush=True,
+        )
+        print(
+            f"[{tag}] На Pi в команде send обязательно `--host <IP_ЭТОГО_ПК>` чтобы поток полетел на ПК.",
+            flush=True,
+        )
+
+    sink = shlex_join(_video_sink_command())
+    if transport == "udp":
+        print(f"[{tag}] пример видео (GStreamer):\n  {gst} -q udpsrc port={video_port} buffer-size=262144 ! tsdemux ! ...", flush=True)
+    elif transport == "tcp":
+        print(f"[{tag}] пример видео:\n  {gst} tcpclientsrc host={host} port={video_port} ! h264parse ! ...", flush=True)
+    else:
+        print(f"[{tag}] пример видео RTP: см. --video-transport rtp в этом скрипте.", flush=True)
+
+    print(
+        f"[{tag}] Полный режим оператора:\n"
+        f"  python3 examples/pc_parallel_client.py --host {host} --video-transport {transport} \\\n"
+        f"      --video-port {video_port} --control-port {control_port}",
+        flush=True,
+    )
+    return rc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ПК: внешний GStreamer/VLC/ffplay для H.264 TCP/UDP/RTP + управление TCP")
     ap.add_argument("--host", required=True, help="IP Raspberry Pi")
@@ -419,7 +486,15 @@ def main() -> int:
         metavar="SEC",
         help="Опрос АЦП на Pi (JSON adc_read, канал по умолчанию — A1); вывод battery_v в stdout",
     )
+    ap.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="только проверка: TCP control (+ PING), подсказка по видео; плеер не запускать",
+    )
     args = ap.parse_args()
+
+    if args.diagnose:
+        return run_diagnose(args.host, args.video_port, args.control_port, args.video_transport)
 
     player = args.player
     if args.video_transport == "rtp" and player == "ffplay":

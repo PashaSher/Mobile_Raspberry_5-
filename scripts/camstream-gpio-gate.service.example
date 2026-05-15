@@ -14,13 +14,12 @@
 # Отдельный лог gate/debug (до запуска stream_camera): см. ~/.local/share/camstream/camstream_boot.log
 #   или: Environment=CAMSTREAM_BOOT_LOG=/home/pavel/.../logs/camstream_boot.log
 #
-# Hotspot (точка доступа) поднимается только когда реально стартует stream_camera с --ap-ssid …
+# Работает по домашней Wi-Fi (Pi подключается к роутеру, ПК тоже в сети).
+# --host = IP ПК в домашней сети; hotspot не нужен.
 # Если GPIO не дал запуск приложения — подключение к дому (сохранённый профиль NM):
 #   chmod +x scripts/camstream-gpio-wifi-fallback.sh
 #   Environment=CAMSTREAM_HOME_WIFI_CONN=ИмяКакВ_nmcli_connection
-#   ExecStart=.../camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --ap-ssid 12345 --ap-force --host 10.42.0.194 --port 5000 --stream-preset realtime
 # Имя профиля: nmcli -t -f NAME connection show
-# Отключите autoconnect у отдельного профиля «hotspot», если он мешал домашнему Wi‑Fi при загрузке.
 #
 # Если «не запускается» при замыкании на землю:
 #   - Убедитесь, что пин указан BCM (pinout.xyz), общий GND с Pi.
@@ -30,7 +29,7 @@
 #   - Поднимите паузу: Environment=BOOT_GPIO_STABLE_MS=250 в [Service].
 
 [Unit]
-Description=Camera stream (GPIO grounded = run via boot_gpio_gate)
+Description=Camera stream (GPIO grounded = run via boot_gpio_gate, home Wi-Fi)
 After=multi-user.target network-online.target NetworkManager.service
 Wants=network-online.target
 
@@ -48,8 +47,8 @@ Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
 # Имя подключения NetworkManager к домашнему Wi‑Fi (когда приложение не запускается по GPIO):
 # Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
 # Первый python — boot_gpio_gate (системный lgpio/gpiozero под Pi 5); обёртка — .venv stream_camera.
-# Для стабильного operator video после power-up используем udp_h264; IP ПК в hotspot при необходимости замените.
-ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --ap-ssid 12345 --ap-force --host 10.42.0.194 --port 5000 --stream-preset realtime'
+# udp_h264 по домашней сети; замените --host на IP вашего ПК в LAN.
+ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --host 192.168.1.16 --port 5000 --stream-preset realtime'
 
 Restart=no
 
