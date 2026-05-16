@@ -1,0 +1,25 @@
+# Как camstream-webrtc, но старт только при замыкании GPIO (BCM) на GND — см. boot_gpio_gate.
+#
+# sudo cp deploy/systemd/camstream-webrtc-gpio-gate.service.example /etc/systemd/system/camstream.service
+# sudo systemctl daemon-reload && sudo systemctl enable --now camstream.service
+
+[Unit]
+Description=WebRTC stream (GPIO17 grounded = run)
+After=multi-user.target network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pavel
+Group=pavel
+WorkingDirectory=/home/pavel/projects/Mobile_Raspberry_5-
+SupplementaryGroups=gpio
+Environment=CAMSTREAM_BOOT_GPIO_BCM=17
+Environment=BOOT_GPIO_STABLE_MS=400
+Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
+# Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
+ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_webrtc.sh -- -v
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

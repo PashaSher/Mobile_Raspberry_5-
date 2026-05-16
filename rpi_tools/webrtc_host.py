@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import signal
+import time
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
@@ -86,6 +87,88 @@ def _parse_ice_candidate(data: dict) -> RTCIceCandidate | None:
     return candidate
 
 
+def _ice_candidates_from_sdp(sdp: str) -> list[dict]:
+    """ICE из a=candidate: в SDP с sdpMid / sdpMLineIndex по секциям m=."""
+    out: list[dict] = []
+    mid = "0"
+    mline_index = -1
+    for line in (sdp or "").splitlines():
+        line = line.strip()
+        if line.startswith("m="):
+            mline_index += 1
+            mid = str(mline_index)
+        elif line.startswith("a=mid:"):
+            mid = line.split(":", 1)[1].strip()
+        elif line.startswith("a=candidate:"):
+            out.append({
+                "candidate": line[2:],
+                "sdpMid": mid,
+                "sdpMLineIndex": max(0, mline_index),
+            })
+    return out
+
+
+async def _publish_sdp_candidates_to_firebase(
+    signaling: FirebaseSignaling,
+    sdp: str,
+    *,
+    turn_only: bool = False,
+) -> int:
+    """Дублирует ICE из SDP в calleeCandidates (до answer — браузер видит relay сразу)."""
+    n = 0
+    for ent in _ice_candidates_from_sdp(sdp):
+        cand = ent["candidate"]
+        typ = _ice_typ_from_sdp(cand)
+        if turn_only and typ != "relay":
+            continue
+        await signaling.send_ice_candidate(ent)
+        n += 1
+    if n:
+        log.info(
+            "WebRTC: SDP → Firebase calleeCandidates: %d%s",
+            n,
+            " (только relay)" if turn_only else "",
+        )
+    elif turn_only:
+        log.warning(
+            "WebRTC: в SDP answer нет typ relay — Hetzner-only в браузере не подключится"
+        )
+    return n
+
+
+def _ice_typ_from_sdp(sdp_line: str) -> str:
+    """typ host|srflx|relay из SDP candidate line."""
+    parts = (sdp_line or "").split()
+    for i, part in enumerate(parts):
+        if part == "typ" and i + 1 < len(parts):
+            return parts[i + 1]
+    return "?"
+
+
+async def _wait_ice_gathering_complete(pc: RTCPeerConnection, timeout_sec: float = 15.0) -> str:
+    """Ждём relay/host кандидаты перед отправкой answer (важно для TURN-only в браузере)."""
+    state = pc.iceGatheringState
+    if state == "complete":
+        return state
+
+    done = asyncio.Event()
+
+    @pc.on("icegatheringstatechange")
+    async def _on_gather() -> None:
+        if pc.iceGatheringState == "complete":
+            done.set()
+
+    try:
+        await asyncio.wait_for(done.wait(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        log.warning(
+            "WebRTC: ICE gathering не завершился за %.0f с (state=%s) — answer уйдёт с тем, что есть",
+            timeout_sec,
+            pc.iceGatheringState,
+        )
+    return pc.iceGatheringState
+
+
 class WebRTCHost:
     """
     Main WebRTC host: creates peer connection, attaches H.264 video,
@@ -105,6 +188,12 @@ class WebRTCHost:
         profile: str | None = "baseline",
         camera_extra_args: list[str] | None = None,
         command_handler: Callable[[dict], dict] | None = None,
+        ice_config_url: str | None = None,
+        ice_config_token: str | None = None,
+        ice_merge_public_stun: bool = True,
+        ice_fetch_timeout_sec: float = 8.0,
+        ice_config_required: bool = False,
+        ice_turn_only: bool = False,
     ) -> None:
         self._firebase_cred = firebase_cred
         self._firebase_db_url = firebase_db_url
@@ -119,10 +208,18 @@ class WebRTCHost:
         self._video_profile = profile
         self._camera_extra_args = camera_extra_args
 
+        self._ice_config_url = (ice_config_url or "").strip() or None
+        self._ice_config_token = ice_config_token if ice_config_token else None
+        self._ice_merge_public_stun = ice_merge_public_stun
+        self._ice_fetch_timeout_sec = ice_fetch_timeout_sec
+        self._ice_config_required = ice_config_required
+        self._ice_turn_only = ice_turn_only
+
         self._video_track: H264CameraTrack | None = None
         self._pc: RTCPeerConnection | None = None
         self._signaling: FirebaseSignaling | None = None
         self._running = False
+        self._host_session_id = 0
 
     async def run(self) -> None:
         """Main loop: create room, wait for offer, connect, stream."""
@@ -134,8 +231,13 @@ class WebRTCHost:
         )
         self._running = True
         self._prev_ufrag: str | None = None
+        self._signaling = FirebaseSignaling(self._room_id)
+        launch_id = int(time.time() * 1000)
+        await self._signaling.reset_room_for_host_launch(launch_id)
 
         while self._running:
+            if self._host_session_id > 0 and self._signaling:
+                await self._signaling.reset_room_for_retry(self._host_session_id)
             try:
                 await self._session()
             except asyncio.CancelledError:
@@ -146,23 +248,33 @@ class WebRTCHost:
                 await self._cleanup_session()
 
             if self._running:
+                self._host_session_id += 1
                 log.info("WebRTC: session ended, restarting in 2s...")
                 await asyncio.sleep(2.0)
 
     async def _session(self) -> None:
-        self._signaling = FirebaseSignaling(self._room_id)
-        await self._signaling.create_room(clear_offer=self._prev_ufrag is not None)
+        if not self._signaling:
+            self._signaling = FirebaseSignaling(self._room_id)
 
         offer_data = await self._signaling.wait_for_offer(
             prev_ufrag=self._prev_ufrag
         )
         self._prev_ufrag = self._signaling.last_ufrag
 
-        from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+        from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
+        from rpi_tools.webrtc_ice_config import build_rtc_ice_servers
         from rpi_tools.webrtc_video import H264CameraTrack
 
-        ice_servers = [RTCIceServer(urls=s) for s in STUN_SERVERS] if STUN_SERVERS else []
+        ice_servers = await build_rtc_ice_servers(
+            ice_config_url=self._ice_config_url,
+            ice_config_token=self._ice_config_token,
+            fallback_stun_urls=STUN_SERVERS,
+            merge_public_stun=self._ice_merge_public_stun,
+            fetch_timeout_sec=self._ice_fetch_timeout_sec,
+            ice_config_required=self._ice_config_required,
+            ice_turn_only=self._ice_turn_only,
+        )
         config = RTCConfiguration(iceServers=ice_servers)
         self._pc = RTCPeerConnection(configuration=config)
         log.info("WebRTC: peer connection created")
@@ -205,17 +317,33 @@ class WebRTCHost:
             if state == "connected":
                 await self._signaling.set_status("connected")
             elif state in ("failed", "closed", "disconnected"):
-                await self._signaling.set_status("closed")
+                await self._signaling.mark_failed_need_reconnect()
 
         @self._pc.on("iceconnectionstatechange")
         async def on_ice_state():
             log.info("WebRTC: ICE state -> %s", self._pc.iceConnectionState)
 
+        local_ice_typs: list[str] = []
+
         @self._pc.on("icecandidate")
         async def on_ice_candidate(candidate):
             if candidate and self._signaling:
+                sdp_line = candidate.to_sdp()
+                typ = _ice_typ_from_sdp(sdp_line)
+                local_ice_typs.append(typ)
+                if self._ice_turn_only and typ != "relay":
+                    log.debug(
+                        "WebRTC: skip ICE typ=%s для Firebase (режим VPS-only)",
+                        typ,
+                    )
+                    return
+                log.info(
+                    "WebRTC: local ICE typ=%s -> Firebase calleeCandidates (%.80s…)",
+                    typ,
+                    sdp_line,
+                )
                 await self._signaling.send_ice_candidate({
-                    "candidate": candidate.to_sdp(),
+                    "candidate": sdp_line,
                     "sdpMid": candidate.sdpMid,
                     "sdpMLineIndex": candidate.sdpMLineIndex,
                 })
@@ -242,16 +370,34 @@ class WebRTCHost:
 
         seen_candidates: set[str] = set()
 
+        async def _safe_add_remote_ice(candidate: RTCIceCandidate) -> None:
+            if not self._pc:
+                return
+            try:
+                await self._pc.addIceCandidate(candidate)
+            except Exception as ex:
+                log.warning(
+                    "WebRTC: addIceCandidate remote %s:%s failed: %s",
+                    candidate.ip,
+                    candidate.port,
+                    ex,
+                )
+
         def _add_candidate(candidate_data: dict) -> None:
             key = candidate_data.get("candidate", "")
-            if key in seen_candidates:
+            if not key or key in seen_candidates:
                 return
             seen_candidates.add(key)
             candidate = _parse_ice_candidate(candidate_data)
             if candidate and self._pc:
-                log.info("WebRTC: adding remote ICE candidate %s:%s",
-                         candidate.ip, candidate.port)
-                asyncio.ensure_future(self._pc.addIceCandidate(candidate))
+                raw = candidate_data.get("candidate", "")
+                log.info(
+                    "WebRTC: remote ICE typ=%s %s:%s (callerCandidates)",
+                    _ice_typ_from_sdp(raw),
+                    candidate.ip,
+                    candidate.port,
+                )
+                asyncio.ensure_future(_safe_add_remote_ice(candidate))
 
         existing = await self._signaling.poll_remote_candidates()
         for c_data in existing:
@@ -290,6 +436,20 @@ class WebRTCHost:
 
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
+        gather_state = await _wait_ice_gathering_complete(self._pc, timeout_sec=15.0)
+        relay_n = sum(1 for t in local_ice_typs if t == "relay")
+        log.info(
+            "WebRTC: ICE gathering=%s, локальных кандидатов=%d (relay=%d) — typ: %s",
+            gather_state,
+            len(local_ice_typs),
+            relay_n,
+            local_ice_typs[:12] if local_ice_typs else "нет (TURN с Pi не отдался?)",
+        )
+        if relay_n == 0 and local_ice_typs:
+            log.warning(
+                "WebRTC: нет typ relay с Pi — при iceTransportPolicy=relay в браузере "
+                "сессия оборвётся. Запуск с --ice-vps-only и проверьте coturn/UDP 49160-65535 на VPS."
+            )
         log.info("WebRTC: local description set (answer)")
         try:
             for t in self._pc.getTransceivers():
@@ -308,14 +468,20 @@ class WebRTCHost:
         except Exception as ex:
             log.debug("WebRTC: лог кодеков: %s", ex)
 
+        answer_sdp = self._pc.localDescription.sdp
+        await _publish_sdp_candidates_to_firebase(
+            self._signaling,
+            answer_sdp,
+            turn_only=self._ice_turn_only,
+        )
         await self._signaling.send_answer({
-            "sdp": self._pc.localDescription.sdp,
+            "sdp": answer_sdp,
             "type": self._pc.localDescription.type,
         })
 
         async def _poll_and_signal_eoc() -> None:
             """Poll for late candidates, then signal end-of-candidates."""
-            for _ in range(5):
+            for _ in range(20):
                 await asyncio.sleep(1.0)
                 if not self._pc or self._pc.connectionState == "connected":
                     return
@@ -423,6 +589,12 @@ async def run_webrtc_host(
     profile: str | None = "baseline",
     camera_extra_args: list[str] | None = None,
     command_handler: Callable[[dict], dict] | None = None,
+    ice_config_url: str | None = None,
+    ice_config_token: str | None = None,
+    ice_merge_public_stun: bool = True,
+    ice_fetch_timeout_sec: float = 8.0,
+    ice_config_required: bool = False,
+    ice_turn_only: bool = False,
 ) -> None:
     """Entry point: run WebRTC host until interrupted."""
     try:
@@ -446,6 +618,12 @@ async def run_webrtc_host(
         bitrate=bitrate, intra=intra, profile=profile,
         camera_extra_args=camera_extra_args,
         command_handler=command_handler,
+        ice_config_url=ice_config_url,
+        ice_config_token=ice_config_token,
+        ice_merge_public_stun=ice_merge_public_stun,
+        ice_fetch_timeout_sec=ice_fetch_timeout_sec,
+        ice_config_required=ice_config_required,
+        ice_turn_only=ice_turn_only,
     )
 
     loop = asyncio.get_event_loop()

@@ -1,0 +1,20 @@
+# Как camstream-webrtc.service.example, но только relay через Hetzner (--ice-vps-only).
+# ExecStart=…/scripts/camstream_webrtc_vps_only.sh -v
+
+[Unit]
+Description=Pi WebRTC host (Hetzner TURN only)
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pavel
+Group=pavel
+WorkingDirectory=/home/pavel/projects/Mobile_Raspberry_5-
+Environment=CAMSTREAM_PYTHON=/home/pavel/projects/Mobile_Raspberry_5-/.venv/bin/python
+ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_webrtc_vps_only.sh -v
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

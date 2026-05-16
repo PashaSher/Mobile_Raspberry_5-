@@ -776,6 +776,46 @@ def main() -> int:
             "(без камеры и aiortc; проверить cred и --firebase-db-url на Pi)"
         ),
     )
+    p_webrtc.add_argument(
+        "--ice-config-url",
+        default=os.environ.get("ICE_CONFIG_URL") or "",
+        metavar="URL",
+        help=(
+            "HTTP(S) GET JSON с полем iceServers (как GET /api/ice на VPS). "
+            "Пусто — только встроенный Google STUN. Переменная окружения: ICE_CONFIG_URL."
+        ),
+    )
+    p_webrtc.add_argument(
+        "--ice-config-token",
+        default=os.environ.get("ICE_CONFIG_TOKEN") or "",
+        metavar="SECRET",
+        help=(
+            "Токен для ICE API: заголовок Authorization: Bearer … и дублирование в ?token= "
+            "если в URL ещё нет token=. Переменная: ICE_CONFIG_TOKEN (chmod 600 на Pi)."
+        ),
+    )
+    p_webrtc.add_argument(
+        "--no-ice-merge-stun",
+        action="store_true",
+        dest="webrtc_no_ice_merge_stun",
+        help="Не добавлять публичный STUN после списка с ICE API (только то, что вернул сервер).",
+    )
+    p_webrtc.add_argument(
+        "--ice-vps-only",
+        action="store_true",
+        dest="webrtc_ice_vps_only",
+        help=(
+            "Режим отладки «только через Hetzner»: ICE API обязателен, без fallback на Google STUN, "
+            "из ответа API только turn: (relay). Эквивалент --no-ice-merge-stun + жёсткая проверка API."
+        ),
+    )
+    p_webrtc.add_argument(
+        "--ice-fetch-timeout",
+        type=float,
+        default=8.0,
+        metavar="SEC",
+        help="Таймаут HTTP запроса за ICE JSON (по умолчанию 8 с).",
+    )
     # Глобальный -v задаётся *до* подкоманды; дубль здесь — чтобы работало ``webrtc … -v`` (типично в Run/Debug).
     p_webrtc.add_argument(
         "-v",
@@ -938,10 +978,14 @@ def main() -> int:
         if args.webrtc_room_only:
 
             async def _webrtc_room_only() -> None:
+                import time
+
                 from rpi_tools.webrtc_signaling import FirebaseSignaling, init_firebase
 
                 init_firebase(args.firebase_cred, args.firebase_db_url)
-                await FirebaseSignaling(args.room).create_room()
+                await FirebaseSignaling(args.room).reset_room_for_host_launch(
+                    int(time.time() * 1000)
+                )
 
             try:
                 asyncio.run(_webrtc_room_only())
@@ -993,6 +1037,8 @@ def main() -> int:
         tank_speed = args.romeo_tank_speed
         turret_step = args.romeo_turret_step
 
+        # Data Channel принимает тот же JSON, что Romeo TCP-сервер; пример для браузера:
+        # examples/webrtc_browser_control_keys.js (WASD drive, стрелки → turret_smooth / turret_stop).
         def _webrtc_command_handler(obj: dict) -> dict:
             cam_result = camera_handler(obj)
             if cam_result is not None:
@@ -1017,6 +1063,18 @@ def main() -> int:
 
         camera_extra = camera_state.build_rpicam_args()
 
+        ice_vps_only = bool(getattr(args, "webrtc_ice_vps_only", False))
+        ice_url = (args.ice_config_url or "").strip() or None
+        ice_token = (args.ice_config_token or "").strip() or None
+        if ice_vps_only:
+            if not ice_url or not ice_token:
+                print(
+                    "webrtc --ice-vps-only: нужны ICE_CONFIG_URL и ICE_CONFIG_TOKEN "
+                    "(config/webrtc.ice.local.env или --ice-config-url / --ice-config-token).",
+                    file=sys.stderr,
+                )
+                return 2
+
         try:
             asyncio.run(run_webrtc_host(
                 firebase_cred=args.firebase_cred,
@@ -1030,6 +1088,14 @@ def main() -> int:
                 profile=args.video_profile,
                 camera_extra_args=camera_extra,
                 command_handler=_webrtc_command_handler,
+                ice_config_url=ice_url,
+                ice_config_token=ice_token,
+                ice_merge_public_stun=not (
+                    args.webrtc_no_ice_merge_stun or ice_vps_only
+                ),
+                ice_fetch_timeout_sec=float(args.ice_fetch_timeout),
+                ice_config_required=ice_vps_only,
+                ice_turn_only=ice_vps_only,
             ))
         except KeyboardInterrupt:
             log.info("webrtc: остановка по Ctrl+C")

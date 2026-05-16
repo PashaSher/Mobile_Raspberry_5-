@@ -28,6 +28,8 @@
   python stream_camera.py flash-romeo
   python stream_camera.py firebase-probe --firebase-cred bro-oppy-firebase-adminsdk-fbsvc-….json
   python stream_camera.py webrtc --firebase-cred … --firebase-db-url https://PROJECT-default-rtdb.firebaseio.com
+  # Вне домашней сети (TURN на VPS): ICE_CONFIG_* или --ice-config-url / --ice-config-token (config/webrtc.ice.env.example).
+  # Отладка только через Hetzner relay: webrtc … --ice-vps-only (Run and Debug: «webrtc via Hetzner only»).
   # Комната RTDB для WebRTC по умолчанию: pi-camera (см. examples/WEBRTC_ROOM_pi-camera.txt и examples/rtdb_room_pi_camera.js)
   python stream_camera.py wifi-scan
   python stream_camera.py wifi-connect "ИмяСети" --password-file ~/wifi.key

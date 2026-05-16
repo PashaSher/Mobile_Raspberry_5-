@@ -1,0 +1,43 @@
+# WebRTC host на Pi: Firebase signaling + ICE/TURN с Hetzner VPS.
+#
+# Подготовка (один раз на Pi):
+#   1. Ключ Firebase в корне проекта (как в firebase.debug.env.example).
+#   2. config/firebase.debug.env  — cp config/firebase.debug.env.example
+#   3. config/webrtc.ice.local.env — вывод с VPS:
+#        sudo /root/project/scripts/show-ice-client-env.sh
+#      (или scripts/ensure_webrtc_ice_env.sh и вручную токен)
+#   4. chmod +x scripts/camstream_webrtc.sh
+#
+# Установка:
+#   sudo cp deploy/systemd/camstream-webrtc.service.example /etc/systemd/system/camstream.service
+#   sudo nano /etc/systemd/system/camstream.service   # User, WorkingDirectory, пути
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now camstream.service
+#
+# Логи: sudo journalctl -u camstream.service -f
+# Проверка ICE без камеры:
+#   ./scripts/camstream_webrtc.sh --room-only
+#
+# Если раньше был GPIO/udp_h264 — замените unit целиком или отдельное имя:
+#   camstream-webrtc.service
+
+[Unit]
+Description=Pi camera WebRTC (Firebase + VPS TURN)
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pavel
+Group=pavel
+WorkingDirectory=/home/pavel/projects/Mobile_Raspberry_5-
+SupplementaryGroups=gpio
+Environment=CAMSTREAM_PYTHON=/home/pavel/projects/Mobile_Raspberry_5-/.venv/bin/python
+# Домашний Wi‑Fi, если используете GPIO-вариант с fallback (см. camstream-webrtc-gpio-gate.service.example):
+# Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
+ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_webrtc.sh -v
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

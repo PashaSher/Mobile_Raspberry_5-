@@ -1,0 +1,41 @@
+# Reverse SSH: с ПК → VPS → Pi (порт 2222 на VPS = ssh Pi).
+#
+# На Pi (один раз):
+#   sudo apt install autossh openssh-client
+#   ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_pi_vps -N ""
+#   ssh-copy-id -i ~/.ssh/id_ed25519_pi_vps.pub VPS_USER@116.203.148.254
+#
+#   sudo cp deploy/systemd/autossh-pi-tunnel.service.example /etc/systemd/system/autossh-pi-tunnel.service
+#   sudo nano /etc/systemd/system/autossh-pi-tunnel.service
+#     User, VPS_USER, путь к ключу
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now autossh-pi-tunnel.service
+#
+# С ПК:
+#   ssh -J VPS_USER@116.203.148.254 -p 2222 pavel@127.0.0.1
+
+[Unit]
+Description=Reverse SSH tunnel Pi → Hetzner VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pavel
+Environment=AUTOSSH_GATETIME=0
+Environment=AUTOSSH_POLL=30
+# Подставьте пользователя на VPS (не root, если так настроено):
+Environment=VPS_USER=deploy
+Environment=VPS_HOST=116.203.148.254
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o "ServerAliveInterval=30" -o "ServerAliveCountMax=3" \
+  -o "ExitOnForwardFailure=yes" \
+  -o "IdentitiesOnly=yes" \
+  -i /home/pavel/.ssh/id_ed25519_pi_vps \
+  -R 127.0.0.1:2222:127.0.0.1:22 \
+  ${VPS_USER}@${VPS_HOST}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -55,7 +55,10 @@ class FirebaseSignaling:
             offer        — SDP offer (JSON string, written by client)
             answer       — SDP answer (JSON string, written by Pi)
             callerCandidates / calleeCandidates — ICE (имена для совместимости с клиентом)
-            status       — "waiting" | "connected" | "closed"
+            status       — "waiting" | "negotiating" | "connected" | "closed"
+            hostLaunchId — меняется при каждом запуске stream_camera webrtc на Pi
+            hostSessionId — +1 при каждом новом цикле ожидания offer на Pi (после обрыва ICE)
+            needOffer      — true: браузеру нужен новый Connect / offer
     """
 
     def __init__(self, room_id: str) -> None:
@@ -68,63 +71,90 @@ class FirebaseSignaling:
     def room_id(self) -> str:
         return self._room_id
 
-    async def create_room(self, *, clear_offer: bool = True) -> None:
-        """Сброс сессии signaling: answer и ICE-кандидаты; status=waiting.
-
-        Раньше здесь был полный delete(/rooms/<id>/), из‑за чего пропадал offer браузера:
-        клиент один раз пишет offer, Pi стирал узел и ждал новый — ответ не уходил никогда.
-
-        clear_offer:
-            True — стереть и offer (новый цикл после прошлого ufrag на этом хосте).
-            False — не трогать offer (первый заход: offer клиента уже может лежать в RTDB).
-        """
+    def _bind_loop(self) -> asyncio.AbstractEventLoop:
         loop = asyncio.get_event_loop()
         self._loop = loop
+        return loop
+
+    def _delete_room_children(self, base: Any, names: tuple[str, ...]) -> None:
+        for name in names:
+            try:
+                base.child(name).delete()
+            except Exception as e:
+                log.debug(
+                    "Firebase: room %r child %s delete: %s",
+                    self._room_id,
+                    name,
+                    e,
+                )
+
+    async def reset_room_for_host_launch(self, launch_id: int) -> None:
+        """Полный сброс комнаты при каждом запуске webrtc на Pi (новый hostLaunchId)."""
+        loop = self._bind_loop()
 
         def _reset() -> None:
             base = self._base_ref
-            for name in ("answer", "calleeCandidates", "callerCandidates"):
-                try:
-                    base.child(name).delete()
-                except Exception as e:
-                    log.debug(
-                        "Firebase: room %r child %s delete: %s",
-                        self._room_id,
-                        name,
-                        e,
-                    )
-            if clear_offer:
-                try:
-                    base.child("offer").delete()
-                except Exception as e:
-                    log.debug(
-                        "Firebase: room %r offer delete: %s",
-                        self._room_id,
-                        e,
-                    )
-            st = base.child("status")
-            st.set("waiting")
-            snapshot = st.get()
-            if snapshot != "waiting":
-                raise RuntimeError(
-                    f"RTDB после set статус всё равно {snapshot!r}; путь={st.path}"
-                )
-
-        try:
-            await loop.run_in_executor(None, _reset)
-        except Exception:
-            log.exception(
-                "Firebase: не удалось записать комнату %r (cred, --firebase-db-url, "
-                "включена ли именно Realtime Database?)",
-                self._room_id,
+            self._delete_room_children(
+                base,
+                ("offer", "answer", "callerCandidates", "calleeCandidates"),
             )
-            raise
+            base.update({
+                "status": "waiting",
+                "hostLaunchId": launch_id,
+                "hostSessionId": 0,
+                "needOffer": True,
+            })
 
-        path = self._base_ref.path
+        await loop.run_in_executor(None, _reset)
         log.info(
-            "Firebase: комната %r готова (%s/status=waiting, clear_offer=%s).",
+            "Firebase: комната %r — новый запуск Pi (hostLaunchId=%s). "
+            "В браузере снова Connect после старта программы.",
             self._room_id,
-            path,
+            launch_id,
+        )
+
+    async def reset_room_for_retry(self, session_id: int) -> None:
+        """Новый цикл после обрыва ICE в том же процессе — нужен свежий offer в браузере."""
+        loop = self._bind_loop()
+
+        def _reset() -> None:
+            base = self._base_ref
+            self._delete_room_children(
+                base,
+                ("offer", "answer", "callerCandidates", "calleeCandidates"),
+            )
+            base.update({
+                "status": "waiting",
+                "hostSessionId": session_id,
+                "needOffer": True,
+            })
+
+        await loop.run_in_executor(None, _reset)
+        log.info(
+            "Firebase: комната %r — цикл %s (hostSessionId), needOffer=true",
+            self._room_id,
+            session_id,
+        )
+
+    async def create_room(self, *, clear_offer: bool = True) -> None:
+        """Устаревший сброс; предпочтительно reset_room_for_host_launch / reset_room_for_retry."""
+        loop = self._bind_loop()
+
+        def _reset() -> None:
+            base = self._base_ref
+            self._delete_room_children(
+                base,
+                ("answer", "calleeCandidates", "callerCandidates"),
+            )
+            if clear_offer:
+                self._delete_room_children(base, ("offer",))
+            base.child("status").set("waiting")
+            base.child("needOffer").set(True)
+
+        await loop.run_in_executor(None, _reset)
+        log.info(
+            "Firebase: комната %r create_room(clear_offer=%s) — лучше reset_room_for_*",
+            self._room_id,
             clear_offer,
         )
 
@@ -199,12 +229,35 @@ class FirebaseSignaling:
         return getattr(self, "_last_ufrag", None)
 
     async def send_answer(self, answer: dict) -> None:
-        """Write SDP answer to Firebase as a plain dict (not JSON string)."""
+        """Write SDP answer; status=negotiating, needOffer=false."""
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(
-            None, self._base_ref.child("answer").set, answer
+
+        def _write() -> None:
+            self._base_ref.child("answer").set(answer)
+            self._base_ref.update({
+                "status": "negotiating",
+                "needOffer": False,
+            })
+
+        await loop.run_in_executor(None, _write)
+        log.info("Firebase: answer sent (status=negotiating, needOffer=false)")
+
+    async def mark_failed_need_reconnect(self) -> None:
+        """ICE/PC оборвались: убрать устаревший answer, снова ждём Connect в браузере."""
+        loop = self._bind_loop()
+
+        def _mark() -> None:
+            base = self._base_ref
+            self._delete_room_children(base, ("answer", "calleeCandidates"))
+            base.update({
+                "status": "waiting",
+                "needOffer": True,
+            })
+
+        await loop.run_in_executor(None, _mark)
+        log.info(
+            "Firebase: сессия не установилась — answer снят, needOffer=true, status=waiting"
         )
-        log.info("Firebase: answer sent")
 
     async def send_ice_candidate(self, candidate: dict) -> None:
         """Push a local ICE candidate to Firebase (calleeCandidates for compatibility)."""

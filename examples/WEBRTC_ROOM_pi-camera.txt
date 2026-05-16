@@ -5,6 +5,9 @@ WebRTC signalling: использовать комнату rooms/pi-camera
   stream_camera.py webrtc … --firebase-cred … --firebase-db-url …
 (--room можно не указывать, это pi-camera.)
 
+При каждом запуске webrtc на Pi комната RTDB сбрасывается (hostLaunchId, needOffer=true).
+После старта Pi в браузере снова Connect. Следить: examples/webrtc_firebase_host_launch.js
+
 На ПК в Romeo WebRTC Operator (webrtc-client.html и т.п.):
 
 1. Найти в коде переменную с именем комнаты (раньше было pi-cam-2 или другое).
@@ -23,4 +26,32 @@ WebRTC signalling: использовать комнату rooms/pi-camera
 - На странице должен быть video.srcObject = inbound stream и ontrack должен навешивать поток на <video>.
 - Data Channel на стороне ПК должен отправлять JSON в канал того же имени («romeo» / тот же label, что создаётся до createOffer у клиента).
 
-На Pi см. профиль --video-profile (по умолчанию main) и лог мы «согласованные кодеки» после answer.
+Управление башней через браузер (как TCP JSON): см. пример привязки клавиш
+  examples/webrtc_browser_control_keys.js
+(WASD = drive; стрелки = turret_smooth / при отпускании turret_stop; Space/Escape/blur — стоп).
+
+На Pi см. профиль --video-profile (по умолчанию baseline) и лог «согласованные кодеки» после answer.
+
+ICE вне домашней сети (VPS coturn + GET /api/ice)
+-----------------------------------------------
+На Pi: переменные ICE_CONFIG_URL / ICE_CONFIG_TOKEN или флаги
+  --ice-config-url … --ice-config-token …
+(шаблон без секретов: config/webrtc.ice.env.example)
+
+В браузере оператора нужны те же iceServers, иначе TURN не поднимется:
+  examples/webrtc_ice_operator_fetch.js → fetch перед new RTCPeerConnection({ iceServers }).
+
+Отладка «только через Hetzner» (как Pi --ice-vps-only):
+  Run and Debug → «RPI: debug (webrtc via Hetzner only)»
+  Браузер: examples/webrtc_operator_vps_only.js → createVpsOnlyPeerConnection(url, token)
+  (iceTransportPolicy: relay + только turn: с ICE API).
+  Обязательно: examples/webrtc_firebase_ice_trickle.js — слушать calleeCandidates с Pi.
+
+Если answer есть, а status был closed и needOffer true — устаревший answer после обрыва ICE;
+  перезапустите Pi (новый hostLaunchId) и снова Connect. Pi теперь снимает answer при обрыве.
+
+Если answer пришёл, но ICE failed / disconnected (~15 с):
+  1) Firebase → rooms/pi-camera/calleeCandidates — должны быть candidate с typ relay (от Pi).
+  2) Pi в логах: «local ICE typ=relay -> Firebase calleeCandidates»; если relay=0 — coturn/UDP на VPS.
+  3) На VPS открыты UDP 3478 и 49160-65535 (relay), external-ip=116.203.148.254 в coturn.
+  4) Браузер: attachFirebaseIceTrickle(roomRef, pc, 'caller') до setRemoteDescription(answer).
