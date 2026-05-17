@@ -146,6 +146,13 @@ def _ice_typ_from_sdp(sdp_line: str) -> str:
     return "?"
 
 
+def _peer_media_ready(pc: RTCPeerConnection) -> bool:
+    """Медиа уже идёт, хотя connectionState в aiortc может оставаться «connecting»."""
+    if pc.connectionState == "connected":
+        return True
+    return pc.iceConnectionState in ("connected", "completed")
+
+
 async def _wait_ice_gathering_complete(pc: RTCPeerConnection, timeout_sec: float = 15.0) -> str:
     """Ждём relay/host кандидаты перед отправкой answer (важно для TURN-only в браузере)."""
     state = pc.iceGatheringState
@@ -188,6 +195,7 @@ class WebRTCHost:
         intra: int = 30,
         profile: str | None = "baseline",
         camera_extra_args: list[str] | None = None,
+        camera_args_provider: Callable[[], list[str]] | None = None,
         command_handler: Callable[[dict], dict] | None = None,
         ice_config_url: str | None = None,
         ice_config_token: str | None = None,
@@ -208,6 +216,8 @@ class WebRTCHost:
         self._video_intra = intra
         self._video_profile = profile
         self._camera_extra_args = camera_extra_args
+        self._camera_args_provider = camera_args_provider
+        self._async_loop: asyncio.AbstractEventLoop | None = None
 
         self._ice_config_url = (ice_config_url or "").strip() or None
         self._ice_config_token = ice_config_token if ice_config_token else None
@@ -230,6 +240,7 @@ class WebRTCHost:
             self._room_id,
         )
         self._running = True
+        self._async_loop = asyncio.get_running_loop()
         self._prev_ufrag: str | None = None
         self._signaling = make_signaling(
             self._room_id,
@@ -322,10 +333,13 @@ class WebRTCHost:
         @self._pc.on("connectionstatechange")
         async def on_connection_state_change():
             state = self._pc.connectionState
-            log.info("WebRTC: connection state -> %s", state)
+            ice = self._pc.iceConnectionState
+            log.info("WebRTC: connection state -> %s (ice=%s)", state, ice)
             if state == "connected":
                 await self._signaling.set_status("connected")
-            elif state in ("failed", "closed", "disconnected"):
+            elif state in ("failed", "closed"):
+                await self._signaling.mark_failed_need_reconnect()
+            elif state == "disconnected" and ice in ("failed", "closed", "disconnected"):
                 await self._signaling.mark_failed_need_reconnect()
 
         @self._pc.on("iceconnectionstatechange")
@@ -492,13 +506,13 @@ class WebRTCHost:
             """Poll for late candidates, then signal end-of-candidates."""
             for _ in range(20):
                 await asyncio.sleep(1.0)
-                if not self._pc or self._pc.connectionState == "connected":
+                if not self._pc or _peer_media_ready(self._pc):
                     return
                 candidates = await self._signaling.poll_remote_candidates()
                 for c_data in candidates:
                     _add_candidate(c_data)
 
-            if self._pc and self._pc.connectionState != "connected":
+            if self._pc and not _peer_media_ready(self._pc):
                 log.info("WebRTC: signaling end-of-candidates")
                 try:
                     await self._pc.addIceCandidate(None)
@@ -507,24 +521,36 @@ class WebRTCHost:
 
         poll_task = asyncio.ensure_future(_poll_and_signal_eoc())
 
-        deadline = asyncio.get_event_loop().time() + 30.0
+        deadline = asyncio.get_event_loop().time() + 60.0
         while self._running and self._pc:
-            state = self._pc.connectionState
-            if state in ("failed", "closed"):
-                log.info("WebRTC: connection %s — ending session", state)
+            pc = self._pc
+            if pc.connectionState in ("failed", "closed"):
+                log.info("WebRTC: connection %s — ending session", pc.connectionState)
                 break
-            if state == "connected":
+            if pc.iceConnectionState in ("failed", "closed"):
+                log.info("WebRTC: ICE %s — ending session", pc.iceConnectionState)
+                break
+            if _peer_media_ready(pc):
+                log.info(
+                    "WebRTC: media path up (connection=%s ice=%s)",
+                    pc.connectionState,
+                    pc.iceConnectionState,
+                )
                 break
             if asyncio.get_event_loop().time() > deadline:
-                log.warning("WebRTC: ICE timeout (30s) — ending session")
+                log.warning(
+                    "WebRTC: connect timeout (60s, connection=%s ice=%s) — ending session",
+                    pc.connectionState,
+                    pc.iceConnectionState,
+                )
                 break
             await asyncio.sleep(0.3)
 
         poll_task.cancel()
 
-        if self._pc and self._pc.connectionState == "connected":
+        if self._pc and _peer_media_ready(self._pc):
             log.info("WebRTC: streaming active, waiting for disconnect...")
-            while self._running and self._pc and self._pc.connectionState == "connected":
+            while self._running and self._pc and _peer_media_ready(self._pc):
                 await asyncio.sleep(1.0)
 
     def _handle_data_channel_message(self, channel, message: str | bytes) -> None:
@@ -543,11 +569,32 @@ class WebRTCHost:
         response: dict
         if self._command_handler:
             try:
-                response = self._command_handler(obj)
+                response = self._command_handler(obj) or {
+                    "ok": False,
+                    "error": "no handler for command",
+                }
             except Exception as e:
                 response = {"ok": False, "error": str(e)}
         else:
             response = {"ok": False, "error": "no command handler configured"}
+
+        if (
+            isinstance(response, dict)
+            and response.get("changed")
+            and str(response.get("camera_action", "")).startswith("camera_")
+            and self._video_track
+            and self._camera_args_provider
+            and self._async_loop
+        ):
+            cam_args = self._camera_args_provider()
+            asyncio.run_coroutine_threadsafe(
+                self._video_track.restart_source(cam_args),
+                self._async_loop,
+            )
+            log.info(
+                "WebRTC: rpicam перезапущен после %s (awbgains/пресет)",
+                response.get("camera_action"),
+            )
 
         if channel and channel.readyState == "open":
             try:
@@ -597,6 +644,7 @@ async def run_webrtc_host(
     intra: int = 30,
     profile: str | None = "baseline",
     camera_extra_args: list[str] | None = None,
+    camera_args_provider: Callable[[], list[str]] | None = None,
     command_handler: Callable[[dict], dict] | None = None,
     ice_config_url: str | None = None,
     ice_config_token: str | None = None,
@@ -626,6 +674,7 @@ async def run_webrtc_host(
         width=width, height=height, fps=fps,
         bitrate=bitrate, intra=intra, profile=profile,
         camera_extra_args=camera_extra_args,
+        camera_args_provider=camera_args_provider,
         command_handler=command_handler,
         ice_config_url=ice_config_url,
         ice_config_token=ice_config_token,

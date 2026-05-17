@@ -31,22 +31,51 @@ from rpi_tools.romeo_usb import start_romeo_adc_monitor, start_romeo_led_heartbe
 
 log = logging.getLogger("camstream")
 
+# IMX708 / Camera Module 3 (Pi 5): --awb auto синит, daylight/1.18,1.06 — жёлто-краснит.
+# --awbgains red,blue отключает AWB. Жёлтый: уменьшить red и/или увеличить blue.
+_IMX708_AWB_GAINS_NEUTRAL = "1.0,1.22"
+_IMX708_AWB_GAINS_DAY = "1.02,1.18"
+_IMX708_AWB_GAINS_INDOOR = "1.05,1.15"
+_IMX708_AWB_GAINS_COOL = "0.95,1.28"
+
 _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
     "auto": {
-        "description": "Автоэкспозиция и автоматический баланс белого.",
-        "args": ["--awb", "auto", "--denoise", "auto", "--hdr", "off"],
+        "description": "Нейтральный AWB IMX708 (меньше жёлтого/красного, gains 1.0,1.22).",
+        "args": ["--awbgains", _IMX708_AWB_GAINS_NEUTRAL, "--denoise", "auto", "--hdr", "off"],
     },
     "day": {
-        "description": "Дневной свет, нейтральная картинка.",
-        "args": ["--awb", "daylight", "--denoise", "auto", "--hdr", "off", "--contrast", "1.05", "--saturation", "1.05"],
+        "description": "Дневной свет, слегка теплее нейтрали (1.02,1.18).",
+        "args": [
+            "--awbgains",
+            _IMX708_AWB_GAINS_DAY,
+            "--denoise",
+            "auto",
+            "--hdr",
+            "off",
+            "--contrast",
+            "1.05",
+            "--saturation",
+            "1.05",
+        ],
     },
     "cloudy": {
-        "description": "Облачная улица.",
-        "args": ["--awb", "cloudy", "--denoise", "auto", "--hdr", "off", "--contrast", "1.04", "--saturation", "1.03"],
+        "description": "Прохладный свет, убирает жёлтый оттенок (0.95,1.28).",
+        "args": [
+            "--awbgains",
+            _IMX708_AWB_GAINS_COOL,
+            "--denoise",
+            "auto",
+            "--hdr",
+            "off",
+            "--contrast",
+            "1.04",
+            "--saturation",
+            "1.03",
+        ],
     },
     "indoor": {
-        "description": "Помещение с искусственным светом.",
-        "args": ["--awb", "indoor", "--denoise", "auto", "--hdr", "off"],
+        "description": "Лампы в помещении, умеренно тёплый (1.05,1.15).",
+        "args": ["--awbgains", _IMX708_AWB_GAINS_INDOOR, "--denoise", "auto", "--hdr", "off"],
     },
     "night": {
         "description": "Ночной/тёмный режим с усиленным шумоподавлением.",
@@ -85,6 +114,7 @@ _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
 
 _CAMERA_PRESET_ALIASES = {
     "default": "auto",
+    "neutral": "auto",
     "daylight": "day",
     "bw": "mono",
     "blackwhite": "mono",
@@ -99,6 +129,31 @@ def _normalize_camera_preset_name(name: object) -> str:
         allowed = ", ".join(sorted(_CAMERA_PRESET_DEFS))
         raise ValueError(f"camera_preset: неизвестный preset {name!r}; доступны: {allowed}")
     return preset
+
+
+def _parse_awb_gains(red: object, blue: object) -> str:
+    try:
+        r = float(red)
+        b = float(blue)
+    except (TypeError, ValueError) as e:
+        raise ValueError("camera_awb: red и blue должны быть числами") from e
+    if not (0.5 <= r <= 4.0 and 0.5 <= b <= 4.0):
+        raise ValueError("camera_awb: red и blue вне диапазона 0.5..4.0")
+    return f"{r:g},{b:g}"
+
+
+def _strip_rpicam_awbgains(args: list[str]) -> list[str]:
+    out: list[str] = []
+    skip = False
+    for item in args:
+        if skip:
+            skip = False
+            continue
+        if item == "--awbgains":
+            skip = True
+            continue
+        out.append(item)
+    return out
 
 
 def _zoom_factor_to_roi(zoom_factor: float) -> str | None:
@@ -118,6 +173,7 @@ class _CameraControlState:
         self._lock = threading.Lock()
         self._preset = "auto"
         self._zoom_factor = 1.0
+        self._awb_gains: str | None = None
         self._generation = 0
 
     def generation(self) -> int:
@@ -130,6 +186,7 @@ class _CameraControlState:
             return {
                 "preset": self._preset,
                 "zoom_factor": round(self._zoom_factor, 3),
+                "awb_gains": self._awb_gains or _IMX708_AWB_GAINS_NEUTRAL,
                 "roi": roi,
             }
 
@@ -137,11 +194,35 @@ class _CameraControlState:
         with self._lock:
             preset = self._preset
             zoom_factor = self._zoom_factor
+            awb_gains = self._awb_gains
         preset_args = list(_CAMERA_PRESET_DEFS[preset]["args"])  # type: ignore[index]
+        if awb_gains:
+            preset_args = _strip_rpicam_awbgains(preset_args)
+            preset_args.extend(("--awbgains", awb_gains))
         roi = _zoom_factor_to_roi(zoom_factor)
         if roi:
             preset_args.extend(("--roi", roi))
         return preset_args
+
+    def set_awb_gains(self, red: object, blue: object) -> dict:
+        gains = _parse_awb_gains(red, blue)
+        with self._lock:
+            changed = gains != self._awb_gains
+            if changed:
+                self._awb_gains = gains
+                self._generation += 1
+            snapshot = {
+                "preset": self._preset,
+                "zoom_factor": round(self._zoom_factor, 3),
+                "awb_gains": self._awb_gains,
+                "roi": _zoom_factor_to_roi(self._zoom_factor),
+            }
+        return {
+            "ok": True,
+            "camera_action": "camera_awb",
+            "changed": changed,
+            "camera": snapshot,
+        }
 
     def set_preset(self, preset_name: object) -> dict:
         preset = _normalize_camera_preset_name(preset_name)
@@ -236,6 +317,17 @@ def _make_camera_control_handler(state: _CameraControlState) -> Callable[[dict],
             if op is None:
                 raise ValueError("camera_zoom: укажите op=in|out|reset или factor")
             return state.step_zoom(str(op), float(step))
+        if act == "camera_awb":
+            red = obj.get("red", obj.get("r"))
+            blue = obj.get("blue", obj.get("b"))
+            if red is None or blue is None:
+                raw = obj.get("awb_gains", obj.get("gains"))
+                if isinstance(raw, str) and "," in raw:
+                    red_s, blue_s = raw.split(",", 1)
+                    red, blue = red_s.strip(), blue_s.strip()
+                else:
+                    raise ValueError('camera_awb: укажите red/blue или awb_gains "1.18,1.06"')
+            return state.set_awb_gains(red, blue)
         return None
 
     return _handle
@@ -1070,6 +1162,14 @@ def _opencv_jpeg_encode_params(jpeg_quality: int) -> list[int]:
 def _picamera2_apply_quality_tuning(picam2: object) -> None:
     """Слегка повышаем резкость; ошибки игнорируем (разные драйверы / версии libcamera)."""
     try:
+        from libcamera import controls
+
+        gains = _IMX708_AWB_GAINS_NEUTRAL
+        red, blue = (float(x) for x in gains.split(",", 1))
+        picam2.set_controls({"ColourGains": (red, blue)})
+    except Exception as exc:
+        log.debug("picamera2: ColourGains не применён: %s", exc)
+    try:
         picam2.set_controls({"Sharpness": 1.35})
     except Exception as exc:
         log.debug("picamera2: Sharpness не применён: %s", exc)
@@ -1195,8 +1295,10 @@ def _picamera2_stream_to_socket(
         dur = max(5000, min(200000, int(round(1_000_000.0 / fp))))
         fps_ctl = {"FrameDurationLimits": (dur, dur)}
 
+    # BGR888 + simplejpeg colorspace "RGB" — корректные цвета на Pi 5 (libcamera 0.7+).
+    _picam_format = "BGR888"
     cfg = picam2.create_video_configuration(
-        main={"size": (w, h), "format": "RGB888"},
+        main={"size": (w, h), "format": _picam_format},
         buffer_count=6,
         controls=fps_ctl or {},
     )
@@ -1206,7 +1308,7 @@ def _picamera2_stream_to_socket(
         log.warning("picamera2: конфиг %dx%d не подошёл (%s), пробуем 640x480", w, h, e)
         w, h = 640, 480
         cfg = picam2.create_video_configuration(
-            main={"size": (w, h), "format": "RGB888"},
+            main={"size": (w, h), "format": _picam_format},
             buffer_count=6,
             controls=fps_ctl or {},
         )
@@ -1271,6 +1373,7 @@ def _picamera2_stream_to_socket(
         enc = JpegEncoder(
             num_threads=enc_threads,
             q=jq,
+            colour_space="RGB",
             colour_subsampling=chroma,
         )
         encoder_session_ok = False
@@ -1345,7 +1448,7 @@ def _picamera2_stream_to_socket(
                     payload = simplejpeg.encode_jpeg(
                         bgr,
                         quality=jq,
-                        colorspace="BGR",
+                        colorspace="RGB",
                         colorsubsampling=chroma,
                         fastdct=jpeg_fast_dct,
                     )

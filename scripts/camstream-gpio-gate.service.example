@@ -6,6 +6,8 @@
 # sudo cp scripts/camstream-gpio-gate.service.example /etc/systemd/system/camstream.service
 # sudo nano /etc/systemd/system/camstream.service   # User, пути
 # chmod +x scripts/camstream-gpio-wifi-fallback.sh scripts/camstream_webrtc.sh
+# Если раньше был webrtc-vps.service — отключите, иначе два stream_camera дерутся за камеру:
+#   sudo systemctl disable --now webrtc-vps.service
 # sudo systemctl daemon-reload && sudo systemctl enable --now camstream.service
 #
 # Лог: sudo journalctl -u camstream.service -f

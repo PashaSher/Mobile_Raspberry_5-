@@ -1087,6 +1087,7 @@ def main() -> int:
                 intra=args.video_intra,
                 profile=args.video_profile,
                 camera_extra_args=camera_extra,
+                camera_args_provider=camera_state.build_rpicam_args,
                 command_handler=_webrtc_command_handler,
                 ice_config_url=ice_url,
                 ice_config_token=ice_token,

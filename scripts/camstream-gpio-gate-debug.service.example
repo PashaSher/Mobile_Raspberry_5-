@@ -37,8 +37,9 @@ Environment=DEBUGPY_LISTEN=0.0.0.0:5678
 # Environment=CAMSTREAM_BOOT_LOG=/home/pavel/projects/Mobile_Raspberry_5-/logs/camstream_boot.log
 # Домашний Wi‑Fi, если приложение не запустилось: Environment=CAMSTREAM_HOME_WIFI_CONN=...
 # chmod +x .../camstream-gpio-wifi-fallback.sh
-# udp_h264 по домашней сети + debugpy; замените --host на IP вашего ПК в LAN.
-ExecStart=/bin/sh -lc 'exec /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_debugpy_listen.sh -- send --video-mode udp_h264 --host 192.168.1.16 --port 5000 --stream-preset realtime'
+# WebRTC + debugpy (как «RPI: debug (webrtc)», но wait-for-client до старта кода).
+# camstream_debugpy_listen.sh получает те же аргументы, что camstream_webrtc.sh → stream_camera.
+ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_debugpy_webrtc.sh -- -v
 
 Restart=no
 

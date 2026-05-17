@@ -6,7 +6,7 @@ say() { echo "[free_camstream_debug_ports] $*" >&2; }
 
 # 1) Если поднят systemd-юнит — лучше остановить службу (иначе родитель может сразу поднять новый процесс).
 if command -v systemctl >/dev/null 2>&1; then
-  for unit in camstream.service camstream; do
+  for unit in camstream.service camstream webrtc-vps.service webrtc-vps; do
     if systemctl is-active --quiet "$unit" 2>/dev/null; then
       if sudo -n systemctl stop "$unit" 2>/dev/null; then
         say "sudo: systemctl stop $unit — ok"
