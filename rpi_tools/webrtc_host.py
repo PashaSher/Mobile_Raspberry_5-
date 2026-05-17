@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import logging
 import signal
@@ -14,7 +15,7 @@ if TYPE_CHECKING:
 
     from rpi_tools.webrtc_video import H264CameraTrack
 
-from rpi_tools.webrtc_signaling import FirebaseSignaling, init_firebase
+from rpi_tools.webrtc_vps_signaling import VpsSignaling, make_signaling
 
 log = logging.getLogger("camstream.webrtc")
 
@@ -109,7 +110,7 @@ def _ice_candidates_from_sdp(sdp: str) -> list[dict]:
 
 
 async def _publish_sdp_candidates_to_firebase(
-    signaling: FirebaseSignaling,
+    signaling: VpsSignaling,
     sdp: str,
     *,
     turn_only: bool = False,
@@ -125,7 +126,7 @@ async def _publish_sdp_candidates_to_firebase(
         n += 1
     if n:
         log.info(
-            "WebRTC: SDP → Firebase calleeCandidates: %d%s",
+            "WebRTC: SDP → VPS calleeCandidates: %d%s",
             n,
             " (только relay)" if turn_only else "",
         )
@@ -177,9 +178,9 @@ class WebRTCHost:
 
     def __init__(
         self,
-        firebase_cred: str,
-        firebase_db_url: str,
         room_id: str,
+        signal_url: str | None = None,
+        ice_token: str | None = None,
         width: int = 1280,
         height: int = 720,
         fps: float = 30.0,
@@ -195,9 +196,9 @@ class WebRTCHost:
         ice_config_required: bool = False,
         ice_turn_only: bool = False,
     ) -> None:
-        self._firebase_cred = firebase_cred
-        self._firebase_db_url = firebase_db_url
         self._room_id = room_id
+        self._signal_url = (signal_url or os.environ.get("WEBRTC_SIGNAL_URL", "")).strip() or None
+        self._ice_token = ice_token or os.environ.get("ICE_CONFIG_TOKEN")
         self._command_handler = command_handler
 
         self._video_width = width
@@ -217,21 +218,24 @@ class WebRTCHost:
 
         self._video_track: H264CameraTrack | None = None
         self._pc: RTCPeerConnection | None = None
-        self._signaling: FirebaseSignaling | None = None
+        self._signaling: VpsSignaling | None = None
         self._running = False
         self._host_session_id = 0
 
     async def run(self) -> None:
         """Main loop: create room, wait for offer, connect, stream."""
-        init_firebase(self._firebase_cred, self._firebase_db_url)
         log.info(
-            "WebRTC: signaling в Firebase только в /rooms/%s/ … "
-            "Имя комнаты ДОЛЖНО быть тем же во всём коде браузера (иначе offer уйдёт «в другую» комнату, answer не вернётся).",
+            "WebRTC: signaling на VPS %s, комната %s",
+            self._signal_url,
             self._room_id,
         )
         self._running = True
         self._prev_ufrag: str | None = None
-        self._signaling = FirebaseSignaling(self._room_id)
+        self._signaling = make_signaling(
+            self._room_id,
+            signal_url=self._signal_url,
+            ice_token=self._ice_token,
+        )
         launch_id = int(time.time() * 1000)
         await self._signaling.reset_room_for_host_launch(launch_id)
 
@@ -254,10 +258,15 @@ class WebRTCHost:
 
     async def _session(self) -> None:
         if not self._signaling:
-            self._signaling = FirebaseSignaling(self._room_id)
+            self._signaling = make_signaling(
+            self._room_id,
+            signal_url=self._signal_url,
+            ice_token=self._ice_token,
+        )
 
         offer_data = await self._signaling.wait_for_offer(
-            prev_ufrag=self._prev_ufrag
+            prev_ufrag=self._prev_ufrag,
+            should_stop=lambda: not self._running,
         )
         self._prev_ufrag = self._signaling.last_ufrag
 
@@ -333,12 +342,12 @@ class WebRTCHost:
                 local_ice_typs.append(typ)
                 if self._ice_turn_only and typ != "relay":
                     log.debug(
-                        "WebRTC: skip ICE typ=%s для Firebase (режим VPS-only)",
+                        "WebRTC: skip ICE typ=%s (режим VPS-only)",
                         typ,
                     )
                     return
                 log.info(
-                    "WebRTC: local ICE typ=%s -> Firebase calleeCandidates (%.80s…)",
+                    "WebRTC: local ICE typ=%s -> VPS calleeCandidates (%.80s…)",
                     typ,
                     sdp_line,
                 )
@@ -578,9 +587,9 @@ class WebRTCHost:
 
 
 async def run_webrtc_host(
-    firebase_cred: str,
-    firebase_db_url: str,
     room_id: str,
+    signal_url: str | None = None,
+    ice_token: str | None = None,
     width: int = 1280,
     height: int = 720,
     fps: float = 30.0,
@@ -611,9 +620,9 @@ async def run_webrtc_host(
         raise SystemExit(1) from e
 
     host = WebRTCHost(
-        firebase_cred=firebase_cred,
-        firebase_db_url=firebase_db_url,
         room_id=room_id,
+        signal_url=signal_url,
+        ice_token=ice_token,
         width=width, height=height, fps=fps,
         bitrate=bitrate, intra=intra, profile=profile,
         camera_extra_args=camera_extra_args,
@@ -640,8 +649,24 @@ async def run_webrtc_host(
         except NotImplementedError:
             pass
 
+    run_task = asyncio.create_task(host.run())
+    stop_wait = asyncio.create_task(stop_event.wait())
     try:
-        await host.run()
+        done, pending = await asyncio.wait(
+            {run_task, stop_wait},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        if stop_wait in done and not run_task.done():
+            host.request_stop()
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+        elif run_task in done:
+            await run_task
     finally:
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:

@@ -2,21 +2,9 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "ensure-firebase-debug-env",
+      "label": "ensure-webrtc-vps-env",
       "type": "shell",
-      "command": "${workspaceFolder}/scripts/ensure_firebase_debug_env.sh",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "silent",
-        "panel": "shared",
-        "showReuseMessage": false,
-        "clear": false
-      }
-    },
-    {
-      "label": "ensure-webrtc-ice-env",
-      "type": "shell",
-      "command": "${workspaceFolder}/scripts/ensure_webrtc_ice_env.sh",
+      "command": "test -f ${workspaceFolder}/config/webrtc.vps.env || (cp ${workspaceFolder}/config/webrtc.vps.env.example ${workspaceFolder}/config/webrtc.vps.env && echo 'Создан config/webrtc.vps.env — вставьте ICE_CONFIG_TOKEN' >&2)",
       "problemMatcher": [],
       "presentation": {
         "reveal": "silent",
@@ -31,18 +19,6 @@
       "command": "${workspaceFolder}/scripts/free_camstream_debug_ports.sh",
       "problemMatcher": [],
       "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "showReuseMessage": false,
-        "clear": false
-      }
-    },
-    {
-      "label": "merge-camstream-debug-env",
-      "type": "shell",
-      "command": "${workspaceFolder}/scripts/merge_camstream_debug_env.sh",
-      "problemMatcher": [],
-      "presentation": {
         "reveal": "silent",
         "panel": "shared",
         "showReuseMessage": false,
@@ -51,33 +27,9 @@
     },
     {
       "label": "webrtc-debug-prep",
-      "dependsOn": [
-        "merge-camstream-debug-env",
-        "free-camstream-debug-ports"
-      ],
+      "dependsOn": ["ensure-webrtc-vps-env", "free-camstream-debug-ports"],
       "dependsOrder": "sequence",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "showReuseMessage": false,
-        "clear": false
-      }
-    },
-    {
-      "label": "webrtc-hetzner-debug-prep",
-      "dependsOn": [
-        "merge-camstream-debug-env",
-        "free-camstream-debug-ports"
-      ],
-      "dependsOrder": "sequence",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "showReuseMessage": false,
-        "clear": false
-      }
+      "problemMatcher": []
     }
   ]
 }

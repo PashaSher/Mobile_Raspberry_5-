@@ -692,24 +692,13 @@ def main() -> int:
 
     p_webrtc = sub.add_parser(
         "webrtc",
-        help="WebRTC Host: H.264 видео + Data Channel управление через Firebase signaling",
+        help="WebRTC Host: H.264 видео + Data Channel (signaling на VPS, без Firebase)",
     )
     p_webrtc.add_argument(
-        "--firebase-cred",
-        required=True,
-        metavar="PATH",
-        type=_firebase_cred_existing_path,
-        help="Путь к serviceAccountKey.json от Firebase",
-    )
-    p_webrtc.add_argument(
-        "--firebase-db-url",
-        required=True,
+        "--signal-url",
+        default=os.environ.get("WEBRTC_SIGNAL_URL", ""),
         metavar="URL",
-        type=_firebase_rtdb_url,
-        help=(
-            "URL Firebase Realtime Database, "
-            "например https://<id>-default-rtdb.firebaseio.com (подобрать: команда firebase-probe)"
-        ),
+        help="VPS signaling API, напр. http://116.203.148.254/api/signal",
     )
     p_webrtc.add_argument(
         "--room",
@@ -980,10 +969,14 @@ def main() -> int:
             async def _webrtc_room_only() -> None:
                 import time
 
-                from rpi_tools.webrtc_signaling import FirebaseSignaling, init_firebase
+                from rpi_tools.webrtc_vps_signaling import VpsSignaling
 
-                init_firebase(args.firebase_cred, args.firebase_db_url)
-                await FirebaseSignaling(args.room).reset_room_for_host_launch(
+                sig = VpsSignaling(
+                    args.room,
+                    api_base=(getattr(args, "signal_url", None) or os.environ.get("WEBRTC_SIGNAL_URL", "")).strip(),
+                    ice_token=(getattr(args, "ice_config_token", None) or os.environ.get("ICE_CONFIG_TOKEN")),
+                )
+                await sig.reset_room_for_host_launch(
                     int(time.time() * 1000)
                 )
 
@@ -996,7 +989,7 @@ def main() -> int:
                 )
                 return 1
             log.info(
-                "webrtc --room-only: ок. В Firebase Console откройте Realtime Database и узел rooms/%s",
+                "webrtc --room-only: ок. VPS signaling, комната %s (откройте http://116.203.148.254/cam)",
                 args.room,
             )
             return 0
@@ -1076,9 +1069,16 @@ def main() -> int:
                 return 2
 
         try:
+            sig_url = (getattr(args, "signal_url", None) or os.environ.get("WEBRTC_SIGNAL_URL", "")).strip()
+            if not sig_url:
+                print(
+                    "webrtc: задайте WEBRTC_SIGNAL_URL (config/webrtc.vps.env) или --signal-url",
+                    file=sys.stderr,
+                )
+                return 2
             asyncio.run(run_webrtc_host(
-                firebase_cred=args.firebase_cred,
-                firebase_db_url=args.firebase_db_url,
+                signal_url=sig_url,
+                ice_token=(args.ice_config_token or "").strip() or None,
                 room_id=args.room,
                 width=args.width,
                 height=args.height,

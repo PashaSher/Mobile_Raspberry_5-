@@ -2,49 +2,23 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "RPI: debug (webrtc + firebase)",
+      "name": "RPI: debug (webrtc)",
       "type": "python",
       "request": "launch",
       "program": "${workspaceFolder}/stream_camera.py",
       "python": "${workspaceFolder}/.venv/bin/python",
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/config/camstream.debug.env",
+      "envFile": "${workspaceFolder}/config/webrtc.vps.env",
       "args": [
         "-v",
         "webrtc",
-        "--firebase-cred",
-        "${workspaceFolder}/bro-oppy-firebase-adminsdk-fbsvc-08c5f0ddfe.json",
-        "--firebase-db-url",
-        "https://bro-oppy-default-rtdb.firebaseio.com",
-        "--room",
-        "pi-camera"
-      ],
-      "justMyCode": false,
-      "preLaunchTask": "webrtc-debug-prep"
-    },
-    {
-      "name": "RPI: debug (webrtc via Hetzner only)",
-      "type": "python",
-      "request": "launch",
-      "program": "${workspaceFolder}/stream_camera.py",
-      "python": "${workspaceFolder}/.venv/bin/python",
-      "console": "integratedTerminal",
-      "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/config/camstream.debug.env",
-      "args": [
-        "-v",
-        "webrtc",
-        "--firebase-cred",
-        "${workspaceFolder}/bro-oppy-firebase-adminsdk-fbsvc-08c5f0ddfe.json",
-        "--firebase-db-url",
-        "https://bro-oppy-default-rtdb.firebaseio.com",
         "--room",
         "pi-camera",
         "--ice-vps-only"
       ],
       "justMyCode": false,
-      "preLaunchTask": "webrtc-hetzner-debug-prep"
+      "preLaunchTask": "webrtc-debug-prep"
     }
   ]
 }

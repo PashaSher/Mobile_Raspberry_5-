@@ -12,6 +12,7 @@ config/firebase.debug.env
 
 # Локальные ICE (TURN) секреты для webrtc — копия с config/webrtc.ice.env.example
 config/webrtc.ice.local.env
+config/webrtc.vps.env
 config/camstream.debug.env
 
 .venv/
