@@ -17,5 +17,6 @@ config/camstream.debug.env
 
 .venv/
 __pycache__/
+.git.corrupt-*/
 *.py[cod]
 *$py.class
