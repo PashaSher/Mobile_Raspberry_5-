@@ -4,8 +4,8 @@
 # Если gate не запустил приложение — маркер от boot_gpio_gate → nmcli connection up CAMSTREAM_HOME_WIFI_CONN.
 #
 # Режимы:
-#   camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 --host 192.168.1.16 --port 5000 --stream-preset realtime
-#   camstream-gpio-wifi-fallback.sh --wrapper /path/camstream_debugpy_listen.sh -- send --video-mode udp_h264 --host 192.168.1.16 --port 5000 --stream-preset realtime
+#   camstream-gpio-wifi-fallback.sh --wrapper …/camstream_webrtc.sh -- -v   # как RPI: debug (webrtc)
+#   camstream-gpio-wifi-fallback.sh send --video-mode udp_h264 …             # legacy LAN
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_GATE="${CAMSTREAM_BOOT_PYTHON:-/usr/bin/python3}"
@@ -26,7 +26,7 @@ if [[ "${1:-}" == "--wrapper" ]]; then
   TARGET=("$WR" "$@")
 else
   if [[ $# -lt 1 ]]; then
-    echo "camstream-gpio-wifi-fallback: нужны аргументы для stream_camera (например: send --video-mode udp_h264 --host 192.168.1.16 …)" >&2
+    echo "camstream-gpio-wifi-fallback: нужны аргументы или --wrapper …/camstream_webrtc.sh -- -v" >&2
     exit 2
   fi
   TARGET=("$PY_APP" "$SCRIPT" "$@")
