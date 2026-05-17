@@ -269,6 +269,16 @@ class VpsSignaling:
     async def set_status(self, status: str) -> None:
         await self._run_sync(lambda: self._http.set_host({"status": status}))
 
+    async def push_host_telemetry(self, patch: dict[str, Any]) -> None:
+        """Обновить host телеметрией (батарея, Wi‑Fi); merge на стороне VPS."""
+        if not patch:
+            return
+
+        def _go() -> None:
+            self._http.set_host(patch, retries=2)
+
+        await self._run_sync(_go)
+
     async def cleanup(self) -> None:
         if self._poll_task:
             self._poll_task.cancel()

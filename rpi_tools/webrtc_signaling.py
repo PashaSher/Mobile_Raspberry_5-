@@ -320,6 +320,16 @@ class FirebaseSignaling:
             None, self._base_ref.child("status").set, status
         )
 
+    async def push_host_telemetry(self, patch: dict[str, Any]) -> None:
+        if not patch:
+            return
+        loop = self._bind_loop()
+
+        def _go() -> None:
+            self._base_ref.update(patch)
+
+        await loop.run_in_executor(None, _go)
+
     async def cleanup(self) -> None:
         """Close listeners with a timeout to avoid blocking."""
         loop = asyncio.get_event_loop()

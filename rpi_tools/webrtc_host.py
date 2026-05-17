@@ -196,6 +196,7 @@ class WebRTCHost:
         profile: str | None = "baseline",
         camera_extra_args: list[str] | None = None,
         camera_args_provider: Callable[[], list[str]] | None = None,
+        camera_state: object | None = None,
         command_handler: Callable[[dict], dict] | None = None,
         ice_config_url: str | None = None,
         ice_config_token: str | None = None,
@@ -203,6 +204,10 @@ class WebRTCHost:
         ice_fetch_timeout_sec: float = 8.0,
         ice_config_required: bool = False,
         ice_turn_only: bool = False,
+        romeo_usb: str | None = None,
+        romeo_baud: int = 115200,
+        telemetry_interval_sec: float = 10.0,
+        wifi_ifname: str | None = None,
     ) -> None:
         self._room_id = room_id
         self._signal_url = (signal_url or os.environ.get("WEBRTC_SIGNAL_URL", "")).strip() or None
@@ -217,6 +222,7 @@ class WebRTCHost:
         self._video_profile = profile
         self._camera_extra_args = camera_extra_args
         self._camera_args_provider = camera_args_provider
+        self._camera_state = camera_state
         self._async_loop: asyncio.AbstractEventLoop | None = None
 
         self._ice_config_url = (ice_config_url or "").strip() or None
@@ -225,6 +231,11 @@ class WebRTCHost:
         self._ice_fetch_timeout_sec = ice_fetch_timeout_sec
         self._ice_config_required = ice_config_required
         self._ice_turn_only = ice_turn_only
+        self._romeo_usb = (romeo_usb or "").strip() or None
+        self._romeo_baud = int(romeo_baud)
+        self._telemetry_interval_sec = max(0.0, float(telemetry_interval_sec))
+        self._wifi_ifname = (wifi_ifname or "").strip() or None
+        self._telemetry_task: asyncio.Task | None = None
 
         self._video_track: H264CameraTrack | None = None
         self._pc: RTCPeerConnection | None = None
@@ -250,22 +261,72 @@ class WebRTCHost:
         launch_id = int(time.time() * 1000)
         await self._signaling.reset_room_for_host_launch(launch_id)
 
+        if self._telemetry_interval_sec > 0:
+            self._telemetry_task = asyncio.create_task(
+                self._telemetry_loop(),
+                name="host-telemetry",
+            )
+            log.info(
+                "WebRTC: телеметрия на VPS каждые %.1f с (батарея + Wi‑Fi)",
+                self._telemetry_interval_sec,
+            )
+
+        try:
+            while self._running:
+                if self._host_session_id > 0 and self._signaling:
+                    await self._signaling.reset_room_for_retry(self._host_session_id)
+                try:
+                    await self._session()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    log.exception("WebRTC session error")
+                finally:
+                    await self._cleanup_session()
+
+                if self._running:
+                    self._host_session_id += 1
+                    log.info("WebRTC: session ended, restarting in 2s...")
+                    await asyncio.sleep(2.0)
+        finally:
+            if self._telemetry_task and not self._telemetry_task.done():
+                self._telemetry_task.cancel()
+                try:
+                    await self._telemetry_task
+                except asyncio.CancelledError:
+                    pass
+                self._telemetry_task = None
+
+    async def _telemetry_loop(self) -> None:
+        from rpi_tools.host_telemetry import build_host_telemetry_patch
+
+        loop = asyncio.get_running_loop()
         while self._running:
-            if self._host_session_id > 0 and self._signaling:
-                await self._signaling.reset_room_for_retry(self._host_session_id)
             try:
-                await self._session()
+                patch = await loop.run_in_executor(
+                    None,
+                    lambda: build_host_telemetry_patch(
+                        romeo_port=self._romeo_usb,
+                        romeo_baud=self._romeo_baud,
+                        wifi_ifname=self._wifi_ifname,
+                    ),
+                )
+                if self._signaling and hasattr(self._signaling, "push_host_telemetry"):
+                    await self._signaling.push_host_telemetry(patch)
+                    log.info(
+                        "WebRTC: telemetry → VPS batteryV=%s wifi=%s%% %s",
+                        patch.get("batteryV", "—"),
+                        patch.get("wifiSignal", "—"),
+                        patch.get("wifiSsid") or "",
+                    )
             except asyncio.CancelledError:
                 break
             except Exception:
-                log.exception("WebRTC session error")
-            finally:
-                await self._cleanup_session()
-
-            if self._running:
-                self._host_session_id += 1
-                log.info("WebRTC: session ended, restarting in 2s...")
-                await asyncio.sleep(2.0)
+                log.debug("WebRTC: telemetry upload failed", exc_info=True)
+            try:
+                await asyncio.sleep(self._telemetry_interval_sec)
+            except asyncio.CancelledError:
+                break
 
     async def _session(self) -> None:
         if not self._signaling:
@@ -430,6 +491,14 @@ class WebRTCHost:
 
         self._signaling.listen_remote_candidates(_add_candidate)
 
+        from rpi_tools.camera_stream import kill_stale_rpicam_processes
+
+        kill_stale_rpicam_processes()
+        cam_args = self._current_camera_args()
+        log.warning(
+            "WebRTC: rpicam camera args для этой сессии: %s",
+            " ".join(cam_args or []) or "(libcamera defaults)",
+        )
         self._video_track = H264CameraTrack(
             width=self._video_width,
             height=self._video_height,
@@ -437,10 +506,11 @@ class WebRTCHost:
             bitrate=self._video_bitrate,
             intra=self._video_intra,
             profile=self._video_profile,
-            camera_extra_args=self._camera_extra_args,
+            camera_extra_args=cam_args,
         )
         try:
-            self._video_track.start_source()
+            self._video_track.start_source(cam_args)
+            self._mark_camera_args_applied(cam_args)
             log.info(
                 "WebRTC: rpicam/камера запущены до SDP answer (быстрее первый RTP)"
             )
@@ -586,14 +656,15 @@ class WebRTCHost:
             and self._camera_args_provider
             and self._async_loop
         ):
-            cam_args = self._camera_args_provider()
+            cam_args = self._current_camera_args()
             asyncio.run_coroutine_threadsafe(
-                self._video_track.restart_source(cam_args),
+                self._restart_rpicam_with_args(cam_args),
                 self._async_loop,
             )
             log.info(
-                "WebRTC: rpicam перезапущен после %s (awbgains/пресет)",
+                "WebRTC: rpicam перезапуск после %s, args=%s",
                 response.get("camera_action"),
+                " ".join(cam_args),
             )
 
         if channel and channel.readyState == "open":
@@ -618,19 +689,33 @@ class WebRTCHost:
                 await self._signaling.cleanup()
             except Exception:
                 pass
-            self._signaling = None
 
     @staticmethod
     def _kill_stale_rpicam() -> None:
-        """Kill any leftover rpicam-vid processes to free the camera."""
-        import subprocess as _sp
-        try:
-            _sp.run(["pkill", "-f", "rpicam-vid"], capture_output=True, timeout=3)
-        except Exception:
-            pass
+        from rpi_tools.camera_stream import kill_stale_rpicam_processes
+
+        kill_stale_rpicam_processes()
 
     def request_stop(self) -> None:
         self._running = False
+
+    def _current_camera_args(self) -> list[str] | None:
+        if self._camera_args_provider:
+            return self._camera_args_provider()
+        return self._camera_extra_args
+
+    def _mark_camera_args_applied(self, cam_args: list[str] | None) -> None:
+        if cam_args is None or self._camera_state is None:
+            return
+        mark = getattr(self._camera_state, "mark_rpicam_applied", None)
+        if callable(mark):
+            mark(cam_args)
+
+    async def _restart_rpicam_with_args(self, cam_args: list[str] | None) -> None:
+        if not self._video_track:
+            return
+        await self._video_track.restart_source(cam_args)
+        self._mark_camera_args_applied(cam_args or [])
 
 
 async def run_webrtc_host(
@@ -645,6 +730,7 @@ async def run_webrtc_host(
     profile: str | None = "baseline",
     camera_extra_args: list[str] | None = None,
     camera_args_provider: Callable[[], list[str]] | None = None,
+    camera_state: object | None = None,
     command_handler: Callable[[dict], dict] | None = None,
     ice_config_url: str | None = None,
     ice_config_token: str | None = None,
@@ -652,6 +738,10 @@ async def run_webrtc_host(
     ice_fetch_timeout_sec: float = 8.0,
     ice_config_required: bool = False,
     ice_turn_only: bool = False,
+    romeo_usb: str | None = None,
+    romeo_baud: int = 115200,
+    telemetry_interval_sec: float = 10.0,
+    wifi_ifname: str | None = None,
 ) -> None:
     """Entry point: run WebRTC host until interrupted."""
     try:
@@ -675,6 +765,7 @@ async def run_webrtc_host(
         bitrate=bitrate, intra=intra, profile=profile,
         camera_extra_args=camera_extra_args,
         camera_args_provider=camera_args_provider,
+        camera_state=camera_state,
         command_handler=command_handler,
         ice_config_url=ice_config_url,
         ice_config_token=ice_config_token,
@@ -682,6 +773,10 @@ async def run_webrtc_host(
         ice_fetch_timeout_sec=ice_fetch_timeout_sec,
         ice_config_required=ice_config_required,
         ice_turn_only=ice_turn_only,
+        romeo_usb=romeo_usb,
+        romeo_baud=romeo_baud,
+        telemetry_interval_sec=telemetry_interval_sec,
+        wifi_ifname=wifi_ifname,
     )
 
     loop = asyncio.get_event_loop()

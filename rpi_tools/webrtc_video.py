@@ -123,7 +123,18 @@ class H264CameraTrack(MediaStreamTrack):
             self._bitrate, self._intra, self._profile,
             self._camera_extra_args,
         )
-        log.info("H264CameraTrack: starting %s", " ".join(cmd))
+        cmd_line = " ".join(cmd)
+        log.warning("H264CameraTrack: starting %s", cmd_line)
+        try:
+            from pathlib import Path
+
+            Path("/tmp/camstream_rpicam_cmd.txt").write_text(
+                cmd_line + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        print(f"\n>>> rpicam-vid: {cmd_line}\n", flush=True)
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -180,15 +191,6 @@ class H264CameraTrack(MediaStreamTrack):
             container = av.open(proc.stdout, format="h264", mode="r")
             for frame in container.decode(video=0):
                 total_frames += 1
-                # Pi/IMX708 часто отдаёт colorspace=6 (не BT.709); aiortc при перекодировании
-                # может уйти в синий/фиолетовый — фиксируем BT.709 + MPEG range.
-                try:
-                    if int(frame.colorspace or 0) not in (1, 5):
-                        frame.colorspace = 1
-                    if int(frame.color_range or 0) == 0:
-                        frame.color_range = 1
-                except (TypeError, ValueError):
-                    pass
                 if total_frames <= 3 or total_frames % 200 == 0:
                     log.info("H264CameraTrack: decoded frame #%d %dx%d",
                              total_frames, frame.width, frame.height)

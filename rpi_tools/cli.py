@@ -757,6 +757,22 @@ def main() -> int:
         help="Шаг башни по умолчанию для action=turret",
     )
     p_webrtc.add_argument(
+        "--telemetry-interval",
+        type=float,
+        default=float(os.environ.get("CAMSTREAM_TELEMETRY_INTERVAL_SEC", "10")),
+        metavar="SEC",
+        help=(
+            "Как часто отправлять на VPS батарею и Wi‑Fi (PUT /host). "
+            "0 — выключить. Env: CAMSTREAM_TELEMETRY_INTERVAL_SEC."
+        ),
+    )
+    p_webrtc.add_argument(
+        "--wifi-ifname",
+        default=os.environ.get("CAMSTREAM_WIFI_IFNAME", ""),
+        metavar="IF",
+        help="Интерфейс Wi‑Fi для телеметрии (по умолчанию — активный wifi в nmcli).",
+    )
+    p_webrtc.add_argument(
         "--room-only",
         action="store_true",
         dest="webrtc_room_only",
@@ -1022,6 +1038,9 @@ def main() -> int:
             )
             return 1
 
+        from rpi_tools.camera_stream import kill_stale_rpicam_processes
+
+        kill_stale_rpicam_processes()
         camera_state = _CameraControlState()
         camera_handler = _make_camera_control_handler(camera_state)
 
@@ -1055,6 +1074,9 @@ def main() -> int:
             return {"ok": True, "reply": "".join(parts)}
 
         camera_extra = camera_state.build_rpicam_args()
+        cam_line = " ".join(camera_extra) or "(libcamera defaults)"
+        log.warning("webrtc: rpicam camera args: %s", cam_line)
+        print(f"\n>>> CAMSTREAM RPICAM ARGS: {cam_line}\n", flush=True)
 
         ice_vps_only = bool(getattr(args, "webrtc_ice_vps_only", False))
         ice_url = (args.ice_config_url or "").strip() or None
@@ -1076,6 +1098,7 @@ def main() -> int:
                     file=sys.stderr,
                 )
                 return 2
+            wifi_if = (getattr(args, "wifi_ifname", None) or "").strip() or None
             asyncio.run(run_webrtc_host(
                 signal_url=sig_url,
                 ice_token=(args.ice_config_token or "").strip() or None,
@@ -1088,6 +1111,7 @@ def main() -> int:
                 profile=args.video_profile,
                 camera_extra_args=camera_extra,
                 camera_args_provider=camera_state.build_rpicam_args,
+                camera_state=camera_state,
                 command_handler=_webrtc_command_handler,
                 ice_config_url=ice_url,
                 ice_config_token=ice_token,
@@ -1097,6 +1121,10 @@ def main() -> int:
                 ice_fetch_timeout_sec=float(args.ice_fetch_timeout),
                 ice_config_required=ice_vps_only,
                 ice_turn_only=ice_vps_only,
+                romeo_usb=romeo_usb,
+                romeo_baud=romeo_baud,
+                telemetry_interval_sec=float(getattr(args, "telemetry_interval", 10)),
+                wifi_ifname=wifi_if,
             ))
         except KeyboardInterrupt:
             log.info("webrtc: остановка по Ctrl+C")

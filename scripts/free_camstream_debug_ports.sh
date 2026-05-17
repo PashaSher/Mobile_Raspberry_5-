@@ -26,6 +26,16 @@ else
 fi
 sleep 0.4
 
+# 2b) Зависший rpicam после Stop debug — иначе AWB из кода не применяется.
+if pkill -TERM -f 'rpicam-vid' 2>/dev/null || pkill -TERM -f 'libcamera-vid' 2>/dev/null; then
+  say "SIGTERM → rpicam-vid / libcamera-vid"
+  sleep 0.3
+  pkill -KILL -f 'rpicam-vid' 2>/dev/null || true
+  pkill -KILL -f 'libcamera-vid' 2>/dev/null || true
+else
+  say "rpicam-vid не найден"
+fi
+
 # 3) На всякий случай снять слушателей с портов (свой пользователь).
 for p in 5000 5001; do
   if fuser -k "${p}/tcp" 2>/dev/null; then

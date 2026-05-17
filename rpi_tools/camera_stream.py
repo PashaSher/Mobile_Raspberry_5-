@@ -31,20 +31,74 @@ from rpi_tools.romeo_usb import start_romeo_adc_monitor, start_romeo_led_heartbe
 
 log = logging.getLogger("camstream")
 
-# IMX708 / Camera Module 3 (Pi 5): --awb auto синит, daylight/1.18,1.06 — жёлто-краснит.
-# --awbgains red,blue отключает AWB. Жёлтый: уменьшить red и/или увеличить blue.
-_IMX708_AWB_GAINS_NEUTRAL = "1.0,1.22"
-_IMX708_AWB_GAINS_DAY = "1.02,1.18"
-_IMX708_AWB_GAINS_INDOOR = "1.05,1.15"
-_IMX708_AWB_GAINS_COOL = "0.95,1.28"
+# IMX708 / Camera Module 3: --awbgains red,blue (отключает AWB). Оба gain > ~1.1.
+# Жёлтый: ниже red, выше blue; зелёный: выше red, ниже blue; яркость: --ev.
+_IMX708_AWB_GAINS_NEUTRAL = "1.20,1.24"
+_IMX708_AWB_GAINS_NATIVE = "1.26,1.18"
+_IMX708_AWB_GAINS_DAY = "1.22,1.22"
+_IMX708_AWB_GAINS_INDOOR = "1.24,1.20"
+_IMX708_AWB_GAINS_COOL = "1.10,1.36"
+_IMX708_EV_NEUTRAL = "-2.5"
+_IMX708_NATIVE_EV = "-1"
+
+# Встроенные режимы AWB libcamera (rpicam --awb). На IMX708 auto/tungsten часто синие.
+_LIBCAMERA_AWB_MODES = frozenset({
+    "auto",
+    "incandescent",
+    "tungsten",
+    "fluorescent",
+    "indoor",
+    "daylight",
+    "cloudy",
+    "custom",
+})
 
 _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
+    "native": {
+        "description": (
+            "IMX708 стрим: awbgains 1.26,1.18, ev -1, saturation 0.80 (сильно против зелёного)."
+        ),
+        "color_overrides": False,
+        "args": [
+            "--awbgains",
+            _IMX708_AWB_GAINS_NATIVE,
+            "--ev",
+            _IMX708_NATIVE_EV,
+            "--saturation",
+            "0.80",
+        ],
+    },
+    "native_auto": {
+        "description": "Чистый libcamera: AWB auto, ev 0 (на IMX708 обычно сильно синий).",
+        "color_overrides": False,
+        "args": [],
+    },
+    "native_tungsten": {
+        "description": "Только --awb tungsten (если gains слишком тёплые).",
+        "color_overrides": False,
+        "args": ["--awb", "tungsten"],
+    },
     "auto": {
-        "description": "Нейтральный AWB IMX708 (меньше жёлтого/красного, gains 1.0,1.22).",
-        "args": ["--awbgains", _IMX708_AWB_GAINS_NEUTRAL, "--denoise", "auto", "--hdr", "off"],
+        "description": "IMX708: полная подстройка (1.14,1.32), ev -2.5.",
+        "args": [
+            "--awbgains",
+            _IMX708_AWB_GAINS_NEUTRAL,
+            "--ev",
+            _IMX708_EV_NEUTRAL,
+            "--metering",
+            "centre",
+            "--contrast",
+            "0.94",
+            "--saturation",
+            "0.85",
+            "--denoise",
+            "auto",
+            "--hdr",
+            "off",
+        ],
     },
     "day": {
-        "description": "Дневной свет, слегка теплее нейтрали (1.02,1.18).",
+        "description": "Дневной свет, слегка теплее нейтрали (1.16,1.28).",
         "args": [
             "--awbgains",
             _IMX708_AWB_GAINS_DAY,
@@ -59,7 +113,7 @@ _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
         ],
     },
     "cloudy": {
-        "description": "Прохладный свет, убирает жёлтый оттенок (0.95,1.28).",
+        "description": "Прохладный свет, убирает жёлтый (1.10,1.36).",
         "args": [
             "--awbgains",
             _IMX708_AWB_GAINS_COOL,
@@ -74,7 +128,7 @@ _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
         ],
     },
     "indoor": {
-        "description": "Лампы в помещении, умеренно тёплый (1.05,1.15).",
+        "description": "Лампы в помещении, умеренно тёплый (1.18,1.26).",
         "args": ["--awbgains", _IMX708_AWB_GAINS_INDOOR, "--denoise", "auto", "--hdr", "off"],
     },
     "night": {
@@ -112,14 +166,52 @@ _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
     },
 }
 
+def _preset_color_overrides(preset: str) -> bool:
+    """False = rpicam/libcamera по умолчанию (AWB auto, ev 0, saturation 1)."""
+    item = _CAMERA_PRESET_DEFS.get(preset, {})
+    return bool(item.get("color_overrides", True))
+
+
 _CAMERA_PRESET_ALIASES = {
-    "default": "auto",
+    "default": "native",
+    "raw": "native",
+    "libcamera": "native",
     "neutral": "auto",
+    "imx708": "auto",
     "daylight": "day",
     "bw": "mono",
     "blackwhite": "mono",
     "black_and_white": "mono",
 }
+
+
+def _normalize_libcamera_awb_mode(name: object) -> str:
+    mode = str(name or "").strip().lower()
+    if mode not in _LIBCAMERA_AWB_MODES:
+        allowed = ", ".join(sorted(_LIBCAMERA_AWB_MODES))
+        raise ValueError(f"camera_awb_mode: неизвестный режим {name!r}; доступны: {allowed}")
+    return mode
+
+
+def _preset_rpicam_arg(args: list[str], flag: str) -> str | None:
+    for i, item in enumerate(args):
+        if item == flag and i + 1 < len(args):
+            return str(args[i + 1])
+    return None
+
+
+def _awb_mode_from_preset_args(preset: str) -> str | None:
+    args = _CAMERA_PRESET_DEFS.get(preset, {}).get("args", [])
+    if not isinstance(args, list):
+        return None
+    return _preset_rpicam_arg(args, "--awb")
+
+
+def _awbgains_from_preset_args(preset: str) -> str | None:
+    args = _CAMERA_PRESET_DEFS.get(preset, {}).get("args", [])
+    if not isinstance(args, list):
+        return None
+    return _preset_rpicam_arg(args, "--awbgains")
 
 
 def _normalize_camera_preset_name(name: object) -> str:
@@ -142,18 +234,59 @@ def _parse_awb_gains(red: object, blue: object) -> str:
     return f"{r:g},{b:g}"
 
 
-def _strip_rpicam_awbgains(args: list[str]) -> list[str]:
+def _strip_rpicam_option(args: list[str], flag: str) -> list[str]:
     out: list[str] = []
     skip = False
     for item in args:
         if skip:
             skip = False
             continue
-        if item == "--awbgains":
+        if item == flag:
             skip = True
             continue
         out.append(item)
     return out
+
+
+def _strip_rpicam_awbgains(args: list[str]) -> list[str]:
+    return _strip_rpicam_option(args, "--awbgains")
+
+
+def _apply_env_rpicam_overrides(args: list[str]) -> list[str]:
+    """Переопределение из env (удобно в launch.json без правки кода)."""
+    out = list(args)
+    gains = os.environ.get("CAMSTREAM_AWB_GAINS", "").strip()
+    if gains:
+        out = _strip_rpicam_awbgains(out)
+        out = _strip_rpicam_option(out, "--awb")
+        out.extend(("--awbgains", gains))
+    ev = os.environ.get("CAMSTREAM_EV", "").strip()
+    if ev:
+        out = _strip_rpicam_option(out, "--ev")
+        out.extend(("--ev", ev))
+    sat = os.environ.get("CAMSTREAM_SATURATION", "").strip()
+    if sat:
+        out = _strip_rpicam_option(out, "--saturation")
+        out.extend(("--saturation", sat))
+    return out
+
+
+def kill_stale_rpicam_processes() -> None:
+    """Снять зависший rpicam-vid после Stop debug (иначе старые AWB gains)."""
+    import subprocess
+    import time
+
+    for sig in ("-TERM", "-KILL"):
+        for pattern in ("rpicam-vid", "libcamera-vid"):
+            try:
+                subprocess.run(
+                    ["pkill", sig, "-f", pattern],
+                    capture_output=True,
+                    timeout=3,
+                )
+            except Exception:
+                pass
+        time.sleep(0.25)
 
 
 def _zoom_factor_to_roi(zoom_factor: float) -> str | None:
@@ -171,76 +304,248 @@ class _CameraControlState:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._preset = "auto"
+        self._preset = "native"
         self._zoom_factor = 1.0
         self._awb_gains: str | None = None
+        self._awb_mode: str | None = None
+        self._ev: str | None = None
         self._generation = 0
+        self._last_applied_rpicam_args: tuple[str, ...] | None = None
 
     def generation(self) -> int:
         with self._lock:
             return self._generation
 
+    def _effective_awb_mode(self) -> str:
+        if self._awb_gains or _awbgains_from_preset_args(self._preset):
+            return "manual"
+        if self._awb_mode:
+            return self._awb_mode
+        from_preset = _awb_mode_from_preset_args(self._preset)
+        if from_preset:
+            return from_preset
+        if _preset_color_overrides(self._preset):
+            return "manual"
+        return "auto"
+
+    def _effective_ev(self) -> str | None:
+        if self._ev is not None:
+            return self._ev
+        if _preset_color_overrides(self._preset):
+            return _IMX708_EV_NEUTRAL
+        preset = self._preset
+        args = _CAMERA_PRESET_DEFS.get(preset, {}).get("args", [])
+        if isinstance(args, list):
+            return _preset_rpicam_arg(args, "--ev")
+        return None
+
+    def _color_fields_for_snapshot(self) -> dict[str, object]:
+        preset = self._preset
+        if self._awb_gains:
+            awb_gains: object = self._awb_gains
+        else:
+            from_preset = _awbgains_from_preset_args(preset)
+            if from_preset:
+                awb_gains = from_preset
+            elif _preset_color_overrides(preset):
+                awb_gains = _IMX708_AWB_GAINS_NEUTRAL
+            else:
+                awb_gains = None
+        ev_out: object = self._effective_ev()
+        return {
+            "awb_gains": awb_gains,
+            "awb_mode": self._effective_awb_mode(),
+            "ev": ev_out,
+        }
+
     def snapshot(self) -> dict:
         with self._lock:
             roi = _zoom_factor_to_roi(self._zoom_factor)
-            return {
+            out = {
                 "preset": self._preset,
                 "zoom_factor": round(self._zoom_factor, 3),
-                "awb_gains": self._awb_gains or _IMX708_AWB_GAINS_NEUTRAL,
                 "roi": roi,
             }
+            out.update(self._color_fields_for_snapshot())
+            return out
+
+    def mark_rpicam_applied(self, args: list[str]) -> None:
+        with self._lock:
+            self._last_applied_rpicam_args = tuple(args)
+
+    def _rpicam_args_changed(self, args: list[str]) -> bool:
+        with self._lock:
+            return tuple(args) != self._last_applied_rpicam_args
+
+    def _bump_generation_if_args_changed(self, args: list[str], mutated: bool) -> bool:
+        """True если нужен перезапуск rpicam-vid (новые аргументы или явное изменение state)."""
+        args_changed = self._rpicam_args_changed(args)
+        if mutated or args_changed:
+            with self._lock:
+                self._generation += 1
+        return mutated or args_changed
+
+    def force_refresh(self) -> dict:
+        args = self.build_rpicam_args()
+        with self._lock:
+            self._generation += 1
+        snapshot = {
+            "preset": self._preset,
+            "zoom_factor": round(self._zoom_factor, 3),
+            "roi": _zoom_factor_to_roi(self._zoom_factor),
+        }
+        snapshot.update(self._color_fields_for_snapshot())
+        return {
+            "ok": True,
+            "camera_action": "camera_refresh",
+            "changed": True,
+            "camera": snapshot,
+            "rpicam_args": args,
+        }
 
     def build_rpicam_args(self) -> list[str]:
         with self._lock:
             preset = self._preset
             zoom_factor = self._zoom_factor
             awb_gains = self._awb_gains
+            awb_mode = self._awb_mode
+            ev_override = self._ev
+            color_preset = _preset_color_overrides(preset)
         preset_args = list(_CAMERA_PRESET_DEFS[preset]["args"])  # type: ignore[index]
         if awb_gains:
             preset_args = _strip_rpicam_awbgains(preset_args)
+            preset_args = _strip_rpicam_option(preset_args, "--awb")
             preset_args.extend(("--awbgains", awb_gains))
+        elif awb_mode:
+            preset_args = _strip_rpicam_awbgains(preset_args)
+            preset_args = _strip_rpicam_option(preset_args, "--awb")
+            preset_args.extend(("--awb", awb_mode))
+        preset_args = _strip_rpicam_option(preset_args, "--ev")
+        if ev_override is not None:
+            preset_args.extend(("--ev", ev_override))
+        elif color_preset:
+            preset_args.extend(("--ev", _IMX708_EV_NEUTRAL))
+        else:
+            ev_from_preset = _preset_rpicam_arg(
+                list(_CAMERA_PRESET_DEFS[preset]["args"]),  # type: ignore[index]
+                "--ev",
+            )
+            if ev_from_preset is not None:
+                preset_args.extend(("--ev", ev_from_preset))
         roi = _zoom_factor_to_roi(zoom_factor)
         if roi:
             preset_args.extend(("--roi", roi))
-        return preset_args
+        return _apply_env_rpicam_overrides(preset_args)
 
     def set_awb_gains(self, red: object, blue: object) -> dict:
         gains = _parse_awb_gains(red, blue)
         with self._lock:
-            changed = gains != self._awb_gains
-            if changed:
+            mutated = gains != self._awb_gains
+            if mutated:
                 self._awb_gains = gains
-                self._generation += 1
+                self._awb_mode = None
+        args = self.build_rpicam_args()
+        changed = self._bump_generation_if_args_changed(args, mutated)
+        with self._lock:
             snapshot = {
                 "preset": self._preset,
                 "zoom_factor": round(self._zoom_factor, 3),
-                "awb_gains": self._awb_gains,
                 "roi": _zoom_factor_to_roi(self._zoom_factor),
             }
+            snapshot.update(self._color_fields_for_snapshot())
         return {
             "ok": True,
             "camera_action": "camera_awb",
             "changed": changed,
             "camera": snapshot,
+            "rpicam_args": args,
         }
 
-    def set_preset(self, preset_name: object) -> dict:
-        preset = _normalize_camera_preset_name(preset_name)
+    def set_awb_mode(self, mode: object) -> dict:
+        awb_mode = _normalize_libcamera_awb_mode(mode)
         with self._lock:
-            changed = preset != self._preset
-            if changed:
-                self._preset = preset
-                self._generation += 1
+            mutated = awb_mode != self._effective_awb_mode()
+            if mutated:
+                self._awb_mode = awb_mode
+                self._awb_gains = None
+        args = self.build_rpicam_args()
+        changed = self._bump_generation_if_args_changed(args, mutated)
+        with self._lock:
             snapshot = {
                 "preset": self._preset,
                 "zoom_factor": round(self._zoom_factor, 3),
                 "roi": _zoom_factor_to_roi(self._zoom_factor),
             }
+            snapshot.update(self._color_fields_for_snapshot())
+        return {
+            "ok": True,
+            "camera_action": "camera_awb_mode",
+            "changed": changed,
+            "camera": snapshot,
+            "rpicam_args": args,
+            "available_awb_modes": sorted(_LIBCAMERA_AWB_MODES),
+        }
+
+    def set_ev(self, ev: object) -> dict:
+        try:
+            ev_val = float(ev)
+        except (TypeError, ValueError) as e:
+            raise ValueError("camera_ev: ev должен быть числом (например -2.0)") from e
+        if not (-4.0 <= ev_val <= 4.0):
+            raise ValueError("camera_ev: ev вне диапазона -4.0..4.0")
+        ev_str = f"{ev_val:g}"
+        with self._lock:
+            if self._ev is not None:
+                prev = self._ev
+            elif _preset_color_overrides(self._preset):
+                prev = _IMX708_EV_NEUTRAL
+            else:
+                prev = "0"
+            mutated = ev_str != prev
+            if mutated:
+                self._ev = ev_str
+        args = self.build_rpicam_args()
+        changed = self._bump_generation_if_args_changed(args, mutated)
+        with self._lock:
+            snapshot = {
+                "preset": self._preset,
+                "zoom_factor": round(self._zoom_factor, 3),
+                "roi": _zoom_factor_to_roi(self._zoom_factor),
+            }
+            snapshot.update(self._color_fields_for_snapshot())
+        return {
+            "ok": True,
+            "camera_action": "camera_ev",
+            "changed": changed,
+            "camera": snapshot,
+            "rpicam_args": args,
+        }
+
+    def set_preset(self, preset_name: object) -> dict:
+        preset = _normalize_camera_preset_name(preset_name)
+        with self._lock:
+            mutated = preset != self._preset
+            if mutated:
+                self._preset = preset
+                if not _preset_color_overrides(preset):
+                    self._awb_gains = None
+                    self._awb_mode = None
+                    self._ev = None
+        args = self.build_rpicam_args()
+        changed = self._bump_generation_if_args_changed(args, mutated)
+        with self._lock:
+            snapshot = {
+                "preset": self._preset,
+                "zoom_factor": round(self._zoom_factor, 3),
+                "roi": _zoom_factor_to_roi(self._zoom_factor),
+            }
+            snapshot.update(self._color_fields_for_snapshot())
         return {
             "ok": True,
             "camera_action": "camera_preset",
             "changed": changed,
             "camera": snapshot,
+            "rpicam_args": args,
             "available_presets": sorted(_CAMERA_PRESET_DEFS),
         }
 
@@ -287,10 +592,13 @@ class _CameraControlState:
         return {"ok": True, "camera_action": "camera_presets", "presets": presets}
 
     def status_payload(self) -> dict:
+        args = self.build_rpicam_args()
         return {
             "ok": True,
             "camera_action": "camera_status",
             "camera": self.snapshot(),
+            "rpicam_args": args,
+            "rpicam_applied": list(self._last_applied_rpicam_args or ()),
             "available_presets": sorted(_CAMERA_PRESET_DEFS),
         }
 
@@ -302,6 +610,8 @@ def _make_camera_control_handler(state: _CameraControlState) -> Callable[[dict],
         act = str(obj.get("action", "")).strip().lower()
         if act in ("camera_status", "camera"):
             return state.status_payload()
+        if act in ("camera_refresh", "camera_apply"):
+            return state.force_refresh()
         if act in ("camera_presets", "camera_list_presets"):
             return state.presets_payload()
         if act in ("camera_preset", "camera_mode"):
@@ -328,6 +638,17 @@ def _make_camera_control_handler(state: _CameraControlState) -> Callable[[dict],
                 else:
                     raise ValueError('camera_awb: укажите red/blue или awb_gains "1.18,1.06"')
             return state.set_awb_gains(red, blue)
+        if act == "camera_awb_mode":
+            mode = obj.get("mode", obj.get("awb", obj.get("awb_mode")))
+            if mode is None:
+                raise ValueError(
+                    'camera_awb_mode: укажите mode (tungsten, daylight, fluorescent, auto, …)'
+                )
+            return state.set_awb_mode(mode)
+        if act == "camera_ev":
+            if "ev" not in obj:
+                raise ValueError('camera_ev: укажите поле ev (например -2.0)')
+            return state.set_ev(obj.get("ev"))
         return None
 
     return _handle
@@ -1160,15 +1481,7 @@ def _opencv_jpeg_encode_params(jpeg_quality: int) -> list[int]:
 
 
 def _picamera2_apply_quality_tuning(picam2: object) -> None:
-    """Слегка повышаем резкость; ошибки игнорируем (разные драйверы / версии libcamera)."""
-    try:
-        from libcamera import controls
-
-        gains = _IMX708_AWB_GAINS_NEUTRAL
-        red, blue = (float(x) for x in gains.split(",", 1))
-        picam2.set_controls({"ColourGains": (red, blue)})
-    except Exception as exc:
-        log.debug("picamera2: ColourGains не применён: %s", exc)
+    """Резкость/шум — без ручной коррекции цвета (AWB/EV/saturation — libcamera)."""
     try:
         picam2.set_controls({"Sharpness": 1.35})
     except Exception as exc:

@@ -10,6 +10,9 @@
       "console": "integratedTerminal",
       "cwd": "${workspaceFolder}",
       "envFile": "${workspaceFolder}/config/webrtc.vps.env",
+      "env": {
+        "CAMSTREAM_AWB_GAINS": "1.28,1.16"
+      },
       "args": [
         "-v",
         "webrtc",
