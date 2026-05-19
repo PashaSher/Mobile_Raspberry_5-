@@ -32,9 +32,10 @@ from rpi_tools.romeo_usb import start_romeo_adc_monitor, start_romeo_led_heartbe
 log = logging.getLogger("camstream")
 
 # IMX708 / Camera Module 3: --awbgains red,blue (отключает AWB). Оба gain > ~1.1.
-# Жёлтый: ниже red, выше blue; зелёный: выше red, ниже blue; яркость: --ev.
+# Жёлтый/синий→жёлто-зелёный: ниже red, выше blue; зелёный оттенок: выше red, ниже blue.
+# Без правки кода: CAMSTREAM_AWB_GAINS, CAMSTREAM_EV, CAMSTREAM_SATURATION (см. config/camstream.color.env.example).
 _IMX708_AWB_GAINS_NEUTRAL = "1.20,1.24"
-_IMX708_AWB_GAINS_NATIVE = "1.26,1.18"
+_IMX708_AWB_GAINS_NATIVE = "0.8,1.8"
 _IMX708_AWB_GAINS_DAY = "1.22,1.22"
 _IMX708_AWB_GAINS_INDOOR = "1.24,1.20"
 _IMX708_AWB_GAINS_COOL = "1.10,1.36"
@@ -56,12 +57,25 @@ _LIBCAMERA_AWB_MODES = frozenset({
 _CAMERA_PRESET_DEFS: dict[str, dict[str, object]] = {
     "native": {
         "description": (
-            "IMX708 стрим: awbgains 1.26,1.18, ev -1, saturation 0.80 (сильно против зелёного)."
+            "IMX708 стрим по умолчанию: awbgains 0.8,1.8, ev -1, saturation 0.75. "
+            "Тёплый вариант: preset warm."
         ),
         "color_overrides": False,
         "args": [
             "--awbgains",
             _IMX708_AWB_GAINS_NATIVE,
+            "--ev",
+            _IMX708_NATIVE_EV,
+            "--saturation",
+            "0.75",
+        ],
+    },
+    "warm": {
+        "description": "Тёплый IMX708 (1.26,1.18) — если native кажется холодным.",
+        "color_overrides": False,
+        "args": [
+            "--awbgains",
+            "1.26,1.18",
             "--ev",
             _IMX708_NATIVE_EV,
             "--saturation",
@@ -352,10 +366,17 @@ class _CameraControlState:
             else:
                 awb_gains = None
         ev_out: object = self._effective_ev()
+        preset_args = _CAMERA_PRESET_DEFS.get(preset, {}).get("args", [])
+        sat_out: object = (
+            _preset_rpicam_arg(preset_args, "--saturation")
+            if isinstance(preset_args, list)
+            else None
+        )
         return {
             "awb_gains": awb_gains,
             "awb_mode": self._effective_awb_mode(),
             "ev": ev_out,
+            "saturation": sat_out,
         }
 
     def snapshot(self) -> dict:

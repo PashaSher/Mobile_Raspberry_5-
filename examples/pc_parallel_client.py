@@ -51,6 +51,8 @@ def _translate_control_shortcut(raw: str) -> tuple[str | None, str | None]:
 
     preset_aliases = {
         "auto": "auto",
+        "native": "native",
+        "warm": "warm",
         "day": "day",
         "cloudy": "cloudy",
         "indoor": "indoor",
