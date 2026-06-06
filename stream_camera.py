@@ -27,7 +27,9 @@
   python stream_camera.py romeo
   python stream_camera.py flash-romeo
   python stream_camera.py firebase-probe --firebase-cred bro-oppy-firebase-adminsdk-fbsvc-….json
-  # WebRTC (VPS signaling + TURN): config/webrtc.vps.env, ./scripts/camstream_webrtc.sh
+  # WebRTC (VPS signaling + TURN): config/webrtc.vps.env
+  #   ./scripts/pi_camstream_bootstrap.sh   # проверка VPS, один процесс, room reset, запуск
+  #   ./scripts/camstream_webrtc.sh -v
   # Cursor: Run and Debug → «RPI: debug (webrtc)»; браузер: http://116.203.148.254/cam
   # Комната RTDB для WebRTC по умолчанию: pi-camera (см. examples/WEBRTC_ROOM_pi-camera.txt и examples/rtdb_room_pi_camera.js)
   python stream_camera.py wifi-scan
