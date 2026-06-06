@@ -222,10 +222,24 @@ class VpsSignaling:
         log.info("VPS: answer sent (status=negotiating, needOffer=false)")
 
     async def mark_failed_need_reconnect(self) -> None:
-        await self._run_sync(
-            lambda: self._http.set_host({"status": "waiting", "needOffer": True})
-        )
-        log.info("VPS: session failed — needOffer=true, status=waiting")
+        await self.end_session_for_reconnect(session_id=None)
+
+    async def end_session_for_reconnect(self, session_id: int | None = None) -> None:
+        """После Disconnect/обрыва: очистить SDP/ICE на VPS, needOffer=true — браузер шлёт новый offer."""
+
+        def _go() -> None:
+            self._http.clear_room(timeout_sec=3.0)
+            patch: dict[str, Any] = {"status": "waiting", "needOffer": True}
+            if session_id is not None:
+                patch["hostSessionId"] = session_id
+            self._http.set_host(patch, retries=3)
+
+        self._seen_caller.clear()
+        self._last_ufrag = None
+        self._http._since = 0
+        await self._run_sync(_go)
+        sid = f", hostSessionId={session_id}" if session_id is not None else ""
+        log.info("VPS: session ended — room cleared, needOffer=true%s", sid)
 
     async def send_ice_candidate(self, candidate: dict) -> None:
         await self._run_sync(lambda: self._http.post_callee_candidate(candidate))

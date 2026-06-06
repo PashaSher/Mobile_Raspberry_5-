@@ -243,21 +243,23 @@ class FirebaseSignaling:
         log.info("Firebase: answer sent (status=negotiating, needOffer=false)")
 
     async def mark_failed_need_reconnect(self) -> None:
-        """ICE/PC оборвались: убрать устаревший answer, снова ждём Connect в браузере."""
+        await self.end_session_for_reconnect(session_id=None)
+
+    async def end_session_for_reconnect(self, session_id: int | None = None) -> None:
+        """После Disconnect/обрыва: снять answer/ICE, needOffer=true — ждём новый Connect."""
         loop = self._bind_loop()
 
         def _mark() -> None:
             base = self._base_ref
-            self._delete_room_children(base, ("answer", "calleeCandidates"))
-            base.update({
-                "status": "waiting",
-                "needOffer": True,
-            })
+            self._delete_room_children(base, ("answer", "calleeCandidates", "callerCandidates"))
+            patch: dict[str, Any] = {"status": "waiting", "needOffer": True}
+            if session_id is not None:
+                patch["hostSessionId"] = session_id
+            base.update(patch)
 
         await loop.run_in_executor(None, _mark)
-        log.info(
-            "Firebase: сессия не установилась — answer снят, needOffer=true, status=waiting"
-        )
+        sid = f", hostSessionId={session_id}" if session_id is not None else ""
+        log.info("Firebase: session ended — needOffer=true%s", sid)
 
     async def send_ice_candidate(self, candidate: dict) -> None:
         """Push a local ICE candidate to Firebase (calleeCandidates for compatibility)."""

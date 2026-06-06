@@ -153,6 +153,10 @@ def _peer_media_ready(pc: RTCPeerConnection) -> bool:
     return pc.iceConnectionState in ("connected", "completed")
 
 
+# После ice=disconnected ждём восстановления; дольше — завершаем сессию и ждём новый offer.
+_ICE_DISCONNECT_GRACE_SEC = 4.0
+
+
 async def _wait_ice_gathering_complete(pc: RTCPeerConnection, timeout_sec: float = 15.0) -> str:
     """Ждём relay/host кандидаты перед отправкой answer (важно для TURN-only в браузере)."""
     state = pc.iceGatheringState
@@ -242,6 +246,59 @@ class WebRTCHost:
         self._signaling: VpsSignaling | None = None
         self._running = False
         self._host_session_id = 0
+        self._session_end: asyncio.Event | None = None
+        self._disconnect_since: float | None = None
+
+    def _request_session_end(self, reason: str) -> None:
+        if self._session_end and not self._session_end.is_set():
+            log.info("WebRTC: завершение сессии (%s)", reason)
+            self._session_end.set()
+
+    async def _await_session_end(self) -> None:
+        """Держим сессию, пока браузер подключён; при Disconnect/обрыве — выходим."""
+        if not self._pc or not self._session_end:
+            return
+        log.info(
+            "WebRTC: streaming active — ждём Disconnect или новый offer с VPS (до %.0f с grace на disconnected)",
+            _ICE_DISCONNECT_GRACE_SEC,
+        )
+        while self._running and self._pc and not self._session_end.is_set():
+            pc = self._pc
+            cs = pc.connectionState
+            ice = pc.iceConnectionState
+            if cs in ("failed", "closed") or ice in ("failed", "closed"):
+                self._request_session_end(f"poll {cs}/{ice}")
+                break
+            if cs == "disconnected" or ice == "disconnected":
+                now = time.monotonic()
+                if self._disconnect_since is None:
+                    self._disconnect_since = now
+                elif now - self._disconnect_since >= _ICE_DISCONNECT_GRACE_SEC:
+                    self._request_session_end(
+                        f"disconnected >{_ICE_DISCONNECT_GRACE_SEC:.0f}s ({cs}/{ice})"
+                    )
+                    break
+            else:
+                self._disconnect_since = None
+            try:
+                await asyncio.wait_for(self._session_end.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _finalize_session_for_reconnect(self) -> None:
+        """VPS/Firebase: needOffer=true, очистка SDP — Pi снова в wait_for_offer."""
+        if not self._signaling:
+            return
+        end = getattr(self._signaling, "end_session_for_reconnect", None)
+        if callable(end):
+            await end(self._host_session_id)
+        else:
+            await self._signaling.mark_failed_need_reconnect()
+        self._prev_ufrag = None
+        log.info(
+            "WebRTC: готов к новому Connect (hostSessionId=%s, ждём offer на VPS)",
+            self._host_session_id,
+        )
 
     async def run(self) -> None:
         """Main loop: create room, wait for offer, connect, stream."""
@@ -273,8 +330,6 @@ class WebRTCHost:
 
         try:
             while self._running:
-                if self._host_session_id > 0 and self._signaling:
-                    await self._signaling.reset_room_for_retry(self._host_session_id)
                 try:
                     await self._session()
                 except asyncio.CancelledError:
@@ -286,7 +341,10 @@ class WebRTCHost:
 
                 if self._running:
                     self._host_session_id += 1
-                    log.info("WebRTC: session ended, restarting in 2s...")
+                    log.info(
+                        "WebRTC: session ended, hostSessionId=%s — ждём offer на VPS (2s)",
+                        self._host_session_id,
+                    )
                     await asyncio.sleep(2.0)
         finally:
             if self._telemetry_task and not self._telemetry_task.done():
@@ -358,6 +416,8 @@ class WebRTCHost:
         )
         config = RTCConfiguration(iceServers=ice_servers)
         self._pc = RTCPeerConnection(configuration=config)
+        self._session_end = asyncio.Event()
+        self._disconnect_since = None
         log.info("WebRTC: peer connection created")
 
         v_tx = self._pc.addTransceiver("video", direction="sendrecv")
@@ -398,14 +458,15 @@ class WebRTCHost:
             log.info("WebRTC: connection state -> %s (ice=%s)", state, ice)
             if state == "connected":
                 await self._signaling.set_status("connected")
-            elif state in ("failed", "closed"):
-                await self._signaling.mark_failed_need_reconnect()
-            elif state == "disconnected" and ice in ("failed", "closed", "disconnected"):
-                await self._signaling.mark_failed_need_reconnect()
+            elif state in ("failed", "closed", "disconnected"):
+                self._request_session_end(f"connection={state} (ice={ice})")
 
         @self._pc.on("iceconnectionstatechange")
         async def on_ice_state():
-            log.info("WebRTC: ICE state -> %s", self._pc.iceConnectionState)
+            ice = self._pc.iceConnectionState
+            log.info("WebRTC: ICE state -> %s", ice)
+            if ice in ("failed", "closed"):
+                self._request_session_end(f"ice={ice}")
 
         local_ice_typs: list[str] = []
 
@@ -619,9 +680,7 @@ class WebRTCHost:
         poll_task.cancel()
 
         if self._pc and _peer_media_ready(self._pc):
-            log.info("WebRTC: streaming active, waiting for disconnect...")
-            while self._running and self._pc and _peer_media_ready(self._pc):
-                await asyncio.sleep(1.0)
+            await self._await_session_end()
 
     def _handle_data_channel_message(self, channel, message: str | bytes) -> None:
         if isinstance(message, bytes):
@@ -674,6 +733,12 @@ class WebRTCHost:
                 log.debug("WebRTC: failed to send DC response")
 
     async def _cleanup_session(self) -> None:
+        try:
+            await self._finalize_session_for_reconnect()
+        except Exception:
+            log.warning("WebRTC: finalize session failed", exc_info=True)
+        self._session_end = None
+        self._disconnect_since = None
         if self._video_track:
             self._video_track.stop()
             self._video_track = None
