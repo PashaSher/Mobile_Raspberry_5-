@@ -55,13 +55,11 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-# Делитель на входе АЦП (аккумулятор → узел A0): R верх к «+», R низ к GND.
-# V_акб = V_на_пине × (R1 + R2) / R2. По умолчанию 47k/10k → коэффициент 5.7.
-# Если номиналы другие — перемерьте резисторы или задайте по двум точкам:
-#   export ROMEO_BATTERY_DIVIDER_R1_OHM=26411   # пример: Ubat/Ua0×R2−R2 при R2=10k (17.33В / 4.76В)
-#   export ROMEO_BATTERY_DIVIDER_R2_OHM=10000
+# Делитель на входе АЦП (аккумулятор → узел A1): R1 верх к «+», R2 низ к GND.
+# V_акб = V_на_пине × (R1 + R2) / R2. По умолчанию 47k/47k → коэффициент 2.0 (~4 В АКБ → ~2 В на пине).
+# Переопределение: export ROMEO_BATTERY_DIVIDER_R1_OHM=47000 ROMEO_BATTERY_DIVIDER_R2_OHM=47000
 ROMEO_BATTERY_DIVIDER_R1_OHM = _int_env("ROMEO_BATTERY_DIVIDER_R1_OHM", 47_000)
-ROMEO_BATTERY_DIVIDER_R2_OHM = _int_env("ROMEO_BATTERY_DIVIDER_R2_OHM", 10_000)
+ROMEO_BATTERY_DIVIDER_R2_OHM = _int_env("ROMEO_BATTERY_DIVIDER_R2_OHM", 47_000)
 
 
 def _adc_default_channel() -> int:
@@ -91,23 +89,17 @@ ROMEO_ADC_FIRMWARE_MV_SCALE = _adc_firmware_mv_scale()
 
 
 def _battery_display_scale() -> float:
-    """Множитель после формулы делителя. По умолчанию: при ~3.07 В на пине → 18 В на АКБ (замер)."""
+    """Множитель после формулы делителя. По умолчанию 1.0 — только номиналы R1/R2; точнее: ROMEO_BATTERY_CAL_*."""
     raw = os.environ.get("ROMEO_BATTERY_V_SCALE", "").strip()
     if raw:
         try:
             return float(raw)
         except ValueError:
             pass
-    r1 = float(ROMEO_BATTERY_DIVIDER_R1_OHM)
-    r2 = float(ROMEO_BATTERY_DIVIDER_R2_OHM)
-    pin_v = 3.07  # В на входе АЦП при реальных 18 В на аккумуляторе (мультиметр)
-    u_bat = 18.0
-    est = pin_v * (r1 + r2) / r2
-    return u_bat / est if est > 0 else 1.0
+    return 1.0
 
 
-# Финальная калибровка после делителя: по умолчанию считается из замера U_пин≈3.07 В ↔ U_акб=18 В.
-# Свой коэффициент: export ROMEO_BATTERY_V_SCALE=1.03
+# Доп. множитель после делителя (обычно 1.0). Калибровка: ROMEO_BATTERY_CAL_R1/U1/R2/U2 или ROMEO_BATTERY_V_SCALE.
 ROMEO_BATTERY_V_SCALE = _battery_display_scale()
 
 # --- Калибровка индикатора батареи (после делителя и ROMEO_BATTERY_V_SCALE) ---
@@ -117,12 +109,12 @@ ROMEO_BATTERY_V_SCALE = _battery_display_scale()
 # Режим ROMEO_BATTERY_DISPLAY_CALIB:
 #   affine — по умолчанию; scale — только множитель ROMEO_BATTERY_VOLTAGE_SCALE; linear — свои a,b в env;
 #   off — без поправки.
-# Доп. поправка после делителя и ROMEO_BATTERY_V_SCALE: по умолчанию тождество (a=1, b=0).
-# Две точки (U_est, U_экран) при необходимости: ROMEO_BATTERY_CAL_R1/U1/R2/U2
-_DEFAULT_BATTERY_CAL_R1 = 0.0
-_DEFAULT_BATTERY_CAL_U1 = 0.0
-_DEFAULT_BATTERY_CAL_R2 = 1.0
-_DEFAULT_BATTERY_CAL_U2 = 1.0
+# Доп. поправка после делителя и ROMEO_BATTERY_V_SCALE: affine через (U_est, U_мультиметр).
+# Точка: ~4336 mV на A1, делитель 47k/47k → U_est≈8.67 В ↔ U_акб=8.31 В (замер).
+_DEFAULT_BATTERY_CAL_R1 = 8.672
+_DEFAULT_BATTERY_CAL_U1 = 8.31
+_DEFAULT_BATTERY_CAL_R2 = 0.0
+_DEFAULT_BATTERY_CAL_U2 = 0.0
 
 
 def _battery_affine_ab_from_cal_pairs() -> tuple[float, float]:
