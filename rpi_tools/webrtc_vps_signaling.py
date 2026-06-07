@@ -9,7 +9,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("camstream.webrtc")
 
@@ -110,6 +110,48 @@ class VpsSignaling:
         self._remote_cb: Callable[[dict], None] | None = None
         self._seen_caller: set[str] = set()
         self._last_ufrag: str | None = None
+        self._events_handler: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+
+    def set_events_handler(
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[None]] | None,
+    ) -> None:
+        """Колбэк на каждый ответ /events (telemetryPing, connectIntent, …)."""
+        self._events_handler = handler
+
+    async def _dispatch_events(self, ev: dict[str, Any]) -> None:
+        if not self._events_handler:
+            return
+        try:
+            await self._events_handler(ev)
+        except Exception:
+            log.debug("VPS: events handler failed", exc_info=True)
+
+    @staticmethod
+    def telemetry_ping_from_events(ev: dict[str, Any]) -> int | None:
+        """Сервер шлёт host.telemetryPing — Pi отвечает PUT телеметрией."""
+        for src in (ev.get("host"), ev):
+            if not isinstance(src, dict):
+                continue
+            ping = src.get("telemetryPing")
+            if ping is None:
+                continue
+            try:
+                return int(ping)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    async def _wait_events_async(self, timeout: float) -> dict[str, Any] | None:
+        try:
+            ev = await self._run_sync(lambda: self._http.wait_events(timeout=timeout))
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log.debug("VPS: wait_events: %s", e)
+            return None
+        if isinstance(ev, dict):
+            await self._dispatch_events(ev)
+            return ev
+        return None
 
     @property
     def room_id(self) -> str:
@@ -151,7 +193,9 @@ class VpsSignaling:
     async def reset_room_for_host_launch(self, launch_id: int) -> None:
         def _go() -> None:
             patch = {
-                "needOffer": True,
+                # needOffer=false — браузер не делает авто-Connect (scheduleAutoConnect);
+                # Pi всё равно ждёт offer через /events.
+                "needOffer": False,
                 "hostLaunchId": launch_id,
                 "hostSessionId": 0,
                 "status": "waiting",
@@ -161,7 +205,7 @@ class VpsSignaling:
 
         await self._run_sync(_go)
         log.info(
-            "VPS: room %r — Pi start (hostLaunchId=%s), needOffer=true",
+            "VPS: room %r — Pi start (hostLaunchId=%s), idle/wait (needOffer=false, ручной Connect)",
             self._room_id,
             launch_id,
         )
@@ -169,28 +213,45 @@ class VpsSignaling:
     async def reset_room_for_retry(self, session_id: int) -> None:
         def _go() -> None:
             self._http.set_host({
-                "needOffer": True,
+                "needOffer": False,
                 "hostSessionId": session_id,
                 "status": "waiting",
             })
 
         await self._run_sync(_go)
-        log.info("VPS: room %r — retry cycle %s, needOffer=true", self._room_id, session_id)
+        log.info(
+            "VPS: room %r — retry cycle %s, needOffer=false (ручной Connect)",
+            self._room_id,
+            session_id,
+        )
 
     async def create_room(self, *, clear_offer: bool = True) -> None:
         await self.reset_room_for_host_launch(int(time.time() * 1000))
+
+    @staticmethod
+    def _connect_intent_from_events(ev: dict[str, Any]) -> bool:
+        """Ранний ping Connect до SDP offer (если VPS/браузер шлёт connectIntent)."""
+        intent = ev.get("connectIntent")
+        if intent is True or intent == 1:
+            return True
+        host = ev.get("host") or {}
+        if isinstance(host, dict) and host.get("connectIntent"):
+            return True
+        return False
 
     async def wait_for_offer(
         self,
         prev_ufrag: str | None = None,
         should_stop: Callable[[], bool] | None = None,
+        *,
+        power_idle: bool = False,
     ) -> dict:
-        def _poll_once() -> dict | None:
-            try:
-                ev = self._http.wait_events(timeout=20.0)
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                log.debug("VPS: wait_events (no offer yet): %s", e)
+        async def _poll_once() -> dict | None:
+            ev = await self._wait_events_async(25.0 if power_idle else 20.0)
+            if not ev:
                 return None
+            if power_idle and self._connect_intent_from_events(ev):
+                log.info("VPS: connectIntent ping — ждём SDP offer")
             offer = self._coerce_offer(ev.get("offer"))
             if not offer:
                 return None
@@ -199,11 +260,17 @@ class VpsSignaling:
                 return None
             return offer
 
-        log.info("VPS: waiting for offer on room %s", self._room_id)
+        if power_idle:
+            log.info(
+                "VPS: режим экономии — long-poll (offer + telemetryPing) на room %s",
+                self._room_id,
+            )
+        else:
+            log.info("VPS: waiting for offer on room %s", self._room_id)
         while True:
             if should_stop and should_stop():
                 raise asyncio.CancelledError("VPS: stop while waiting for offer")
-            offer = await self._run_sync(_poll_once)
+            offer = await _poll_once()
             if offer:
                 self._last_ufrag = self._extract_ufrag(offer.get("sdp", ""))
                 log.info(
@@ -224,12 +291,23 @@ class VpsSignaling:
     async def mark_failed_need_reconnect(self) -> None:
         await self.end_session_for_reconnect(session_id=None)
 
-    async def end_session_for_reconnect(self, session_id: int | None = None) -> None:
-        """После Disconnect/обрыва: очистить SDP/ICE на VPS, needOffer=true — браузер шлёт новый offer."""
+    async def end_session_for_reconnect(
+        self,
+        session_id: int | None = None,
+        *,
+        power_idle: bool = False,
+    ) -> None:
+        """После Disconnect/обрыва: очистить SDP/ICE; needOffer=false — без авто-Connect в браузере."""
 
         def _go() -> None:
             self._http.clear_room(timeout_sec=3.0)
-            patch: dict[str, Any] = {"status": "waiting", "needOffer": True}
+            patch: dict[str, Any] = {"needOffer": False}
+            if power_idle:
+                patch["status"] = "idle"
+                patch["powerSave"] = True
+            else:
+                patch["status"] = "waiting"
+                patch["powerSave"] = False
             if session_id is not None:
                 patch["hostSessionId"] = session_id
             self._http.set_host(patch, retries=3)
@@ -239,7 +317,26 @@ class VpsSignaling:
         self._http._since = 0
         await self._run_sync(_go)
         sid = f", hostSessionId={session_id}" if session_id is not None else ""
-        log.info("VPS: session ended — room cleared, needOffer=true%s", sid)
+        if power_idle:
+            log.info(
+                "VPS: session ended — idle/powerSave, needOffer=false%s (ждём Connect в браузере)",
+                sid,
+            )
+        else:
+            log.info(
+                "VPS: session ended — room cleared, needOffer=false%s (ждём Connect в браузере)",
+                sid,
+            )
+
+    async def enter_power_idle(self, session_id: int) -> None:
+        await self.end_session_for_reconnect(session_id, power_idle=True)
+
+    async def enter_power_active(self) -> None:
+        def _go() -> None:
+            self._http.set_host({"status": "waking", "powerSave": False}, retries=2)
+
+        await self._run_sync(_go)
+        log.info("VPS: ping (offer) — пробуждение, status=waking")
 
     async def send_ice_candidate(self, candidate: dict) -> None:
         await self._run_sync(lambda: self._http.post_callee_candidate(candidate))
@@ -263,22 +360,18 @@ class VpsSignaling:
             await asyncio.sleep(0.4)
 
     async def poll_remote_candidates(self) -> list[dict]:
-        def _go() -> list[dict]:
-            try:
-                ev = self._http.wait_events(timeout=2.0)
-            except (urllib.error.URLError, TimeoutError, OSError):
-                return []
-            bag = ev.get("callerCandidates") or {}
-            out: list[dict] = []
-            for cid, raw in bag.items():
-                if cid in self._seen_caller:
-                    continue
-                if isinstance(raw, dict) and raw.get("candidate"):
-                    self._seen_caller.add(cid)
-                    out.append(raw)
-            return out
-
-        return await self._run_sync(_go)
+        ev = await self._wait_events_async(2.0)
+        if not ev:
+            return []
+        bag = ev.get("callerCandidates") or {}
+        out: list[dict] = []
+        for cid, raw in bag.items():
+            if cid in self._seen_caller:
+                continue
+            if isinstance(raw, dict) and raw.get("candidate"):
+                self._seen_caller.add(cid)
+                out.append(raw)
+        return out
 
     async def set_status(self, status: str) -> None:
         await self._run_sync(lambda: self._http.set_host({"status": status}))

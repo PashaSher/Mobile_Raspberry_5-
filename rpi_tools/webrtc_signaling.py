@@ -102,13 +102,12 @@ class FirebaseSignaling:
                 "status": "waiting",
                 "hostLaunchId": launch_id,
                 "hostSessionId": 0,
-                "needOffer": True,
+                "needOffer": False,
             })
 
         await loop.run_in_executor(None, _reset)
         log.info(
-            "Firebase: комната %r — новый запуск Pi (hostLaunchId=%s). "
-            "В браузере снова Connect после старта программы.",
+            "Firebase: комната %r — новый запуск Pi (hostLaunchId=%s), needOffer=false",
             self._room_id,
             launch_id,
         )
@@ -126,12 +125,12 @@ class FirebaseSignaling:
             base.update({
                 "status": "waiting",
                 "hostSessionId": session_id,
-                "needOffer": True,
+                "needOffer": False,
             })
 
         await loop.run_in_executor(None, _reset)
         log.info(
-            "Firebase: комната %r — цикл %s (hostSessionId), needOffer=true",
+            "Firebase: комната %r — цикл %s (hostSessionId), needOffer=false",
             self._room_id,
             session_id,
         )
@@ -149,7 +148,7 @@ class FirebaseSignaling:
             if clear_offer:
                 self._delete_room_children(base, ("offer",))
             base.child("status").set("waiting")
-            base.child("needOffer").set(True)
+            base.child("needOffer").set(False)
 
         await loop.run_in_executor(None, _reset)
         log.info(
@@ -158,7 +157,13 @@ class FirebaseSignaling:
             clear_offer,
         )
 
-    async def wait_for_offer(self, prev_ufrag: str | None = None) -> dict:
+    async def wait_for_offer(
+        self,
+        prev_ufrag: str | None = None,
+        should_stop: Callable[[], bool] | None = None,
+        *,
+        power_idle: bool = False,
+    ) -> dict:
         """Получить SDP offer: сначала уже лежащий в RTDB, иначе слушать изменения."""
         loop = asyncio.get_event_loop()
         offer_ref = self._base_ref.child("offer")
@@ -245,21 +250,47 @@ class FirebaseSignaling:
     async def mark_failed_need_reconnect(self) -> None:
         await self.end_session_for_reconnect(session_id=None)
 
-    async def end_session_for_reconnect(self, session_id: int | None = None) -> None:
+    async def end_session_for_reconnect(
+        self,
+        session_id: int | None = None,
+        *,
+        power_idle: bool = False,
+    ) -> None:
         """После Disconnect/обрыва: снять answer/ICE, needOffer=true — ждём новый Connect."""
         loop = self._bind_loop()
 
         def _mark() -> None:
             base = self._base_ref
             self._delete_room_children(base, ("answer", "calleeCandidates", "callerCandidates"))
-            patch: dict[str, Any] = {"status": "waiting", "needOffer": True}
+            patch: dict[str, Any] = {"needOffer": False}
+            if power_idle:
+                patch["status"] = "idle"
+                patch["powerSave"] = True
+            else:
+                patch["status"] = "waiting"
+                patch["powerSave"] = False
             if session_id is not None:
                 patch["hostSessionId"] = session_id
             base.update(patch)
 
         await loop.run_in_executor(None, _mark)
         sid = f", hostSessionId={session_id}" if session_id is not None else ""
-        log.info("Firebase: session ended — needOffer=true%s", sid)
+        if power_idle:
+            log.info("Firebase: session ended — idle/powerSave, needOffer=false%s", sid)
+        else:
+            log.info("Firebase: session ended — needOffer=false%s", sid)
+
+    async def enter_power_idle(self, session_id: int) -> None:
+        await self.end_session_for_reconnect(session_id, power_idle=True)
+
+    async def enter_power_active(self) -> None:
+        loop = self._bind_loop()
+
+        def _mark() -> None:
+            self._base_ref.update({"status": "waking", "powerSave": False})
+
+        await loop.run_in_executor(None, _mark)
+        log.info("Firebase: ping (offer) — пробуждение, status=waking")
 
     async def send_ice_candidate(self, candidate: dict) -> None:
         """Push a local ICE candidate to Firebase (calleeCandidates for compatibility)."""

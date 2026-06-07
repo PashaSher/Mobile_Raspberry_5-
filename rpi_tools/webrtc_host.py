@@ -157,6 +157,11 @@ def _peer_media_ready(pc: RTCPeerConnection) -> bool:
 _ICE_DISCONNECT_GRACE_SEC = 4.0
 
 
+def _env_power_save() -> bool:
+    v = os.environ.get("WEBRTC_POWER_SAVE", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
 async def _wait_ice_gathering_complete(pc: RTCPeerConnection, timeout_sec: float = 15.0) -> str:
     """Ждём relay/host кандидаты перед отправкой answer (важно для TURN-only в браузере)."""
     state = pc.iceGatheringState
@@ -210,7 +215,7 @@ class WebRTCHost:
         ice_turn_only: bool = False,
         romeo_usb: str | None = None,
         romeo_baud: int = 115200,
-        telemetry_interval_sec: float = 10.0,
+        telemetry_interval_sec: float = 0.0,
         wifi_ifname: str | None = None,
     ) -> None:
         self._room_id = room_id
@@ -240,6 +245,8 @@ class WebRTCHost:
         self._telemetry_interval_sec = max(0.0, float(telemetry_interval_sec))
         self._wifi_ifname = (wifi_ifname or "").strip() or None
         self._telemetry_task: asyncio.Task | None = None
+        self._power_save = _env_power_save()
+        self._last_telemetry_ping = 0
 
         self._video_track: H264CameraTrack | None = None
         self._pc: RTCPeerConnection | None = None
@@ -286,19 +293,69 @@ class WebRTCHost:
                 pass
 
     async def _finalize_session_for_reconnect(self) -> None:
-        """VPS/Firebase: needOffer=true, очистка SDP — Pi снова в wait_for_offer."""
+        """VPS/Firebase: очистка SDP — Pi снова ждёт offer (ручной Connect в браузере)."""
         if not self._signaling:
             return
         end = getattr(self._signaling, "end_session_for_reconnect", None)
         if callable(end):
-            await end(self._host_session_id)
+            await end(self._host_session_id, power_idle=self._power_save)
         else:
             await self._signaling.mark_failed_need_reconnect()
         self._prev_ufrag = None
-        log.info(
-            "WebRTC: готов к новому Connect (hostSessionId=%s, ждём offer на VPS)",
-            self._host_session_id,
-        )
+        if self._power_save:
+            log.info(
+                "WebRTC: режим экономии — камера выкл, ждём ping (offer) на VPS "
+                "(hostSessionId=%s)",
+                self._host_session_id,
+            )
+        else:
+            log.info(
+                "WebRTC: готов к новому Connect (hostSessionId=%s, ждём offer на VPS)",
+                self._host_session_id,
+            )
+
+    async def _enter_power_active(self) -> None:
+        """Пробуждение после ping (SDP offer) с VPS."""
+        if self._signaling:
+            wake = getattr(self._signaling, "enter_power_active", None)
+            if callable(wake):
+                await wake()
+        if self._power_save:
+            log.info("WebRTC: ping (offer) с VPS — включаем камеру")
+
+    async def _on_vps_events(self, ev: dict) -> None:
+        from rpi_tools.webrtc_vps_signaling import VpsSignaling
+
+        ping = VpsSignaling.telemetry_ping_from_events(ev)
+        if ping is None or ping <= self._last_telemetry_ping:
+            return
+        self._last_telemetry_ping = ping
+        await self._push_telemetry_once(ping)
+
+    async def _push_telemetry_once(self, ping: int | None = None) -> None:
+        from rpi_tools.host_telemetry import build_host_telemetry_patch
+
+        loop = asyncio.get_running_loop()
+        try:
+            patch = await loop.run_in_executor(
+                None,
+                lambda: build_host_telemetry_patch(
+                    romeo_port=self._romeo_usb,
+                    romeo_baud=self._romeo_baud,
+                    wifi_ifname=self._wifi_ifname,
+                ),
+            )
+            if self._signaling and hasattr(self._signaling, "push_host_telemetry"):
+                await self._signaling.push_host_telemetry(patch)
+                log.info(
+                    "WebRTC: telemetry ← ping VPS (%s) batteryV=%s wifi=%s%% %s",
+                    ping if ping is not None else "?",
+                    patch.get("batteryV", "—"),
+                    patch.get("wifiSignal", "—"),
+                    patch.get("wifiSsid") or "",
+                )
+        except Exception:
+            log.debug("WebRTC: telemetry on ping failed", exc_info=True)
 
     async def run(self) -> None:
         """Main loop: create room, wait for offer, connect, stream."""
@@ -315,17 +372,32 @@ class WebRTCHost:
             signal_url=self._signal_url,
             ice_token=self._ice_token,
         )
+        set_handler = getattr(self._signaling, "set_events_handler", None)
+        if callable(set_handler):
+            set_handler(self._on_vps_events)
         launch_id = int(time.time() * 1000)
         await self._signaling.reset_room_for_host_launch(launch_id)
+        if self._power_save:
+            enter_idle = getattr(self._signaling, "enter_power_idle", None)
+            if callable(enter_idle):
+                await enter_idle(0)
+            log.info(
+                "WebRTC: старт в режиме экономии — камера выкл, ждём Connect (offer) на VPS"
+            )
 
         if self._telemetry_interval_sec > 0:
             self._telemetry_task = asyncio.create_task(
-                self._telemetry_loop(),
-                name="host-telemetry",
+                self._telemetry_push_loop(),
+                name="host-telemetry-push",
             )
-            log.info(
-                "WebRTC: телеметрия на VPS каждые %.1f с (батарея + Wi‑Fi)",
+            log.warning(
+                "WebRTC: push-телеметрия каждые %.1f с (legacy). "
+                "По умолчанию Pi отвечает только на telemetryPing с VPS.",
                 self._telemetry_interval_sec,
+            )
+        else:
+            log.info(
+                "WebRTC: телеметрия по запросу VPS (host.telemetryPing в /events)"
             )
 
         try:
@@ -341,11 +413,12 @@ class WebRTCHost:
 
                 if self._running:
                     self._host_session_id += 1
-                    log.info(
-                        "WebRTC: session ended, hostSessionId=%s — ждём offer на VPS (2s)",
-                        self._host_session_id,
-                    )
-                    await asyncio.sleep(2.0)
+                    if not self._power_save:
+                        log.info(
+                            "WebRTC: session ended, hostSessionId=%s — ждём offer на VPS (2s)",
+                            self._host_session_id,
+                        )
+                        await asyncio.sleep(2.0)
         finally:
             if self._telemetry_task and not self._telemetry_task.done():
                 self._telemetry_task.cancel()
@@ -355,32 +428,10 @@ class WebRTCHost:
                     pass
                 self._telemetry_task = None
 
-    async def _telemetry_loop(self) -> None:
-        from rpi_tools.host_telemetry import build_host_telemetry_patch
-
-        loop = asyncio.get_running_loop()
+    async def _telemetry_push_loop(self) -> None:
+        """Legacy: периодический PUT /host (выключен по умолчанию)."""
         while self._running:
-            try:
-                patch = await loop.run_in_executor(
-                    None,
-                    lambda: build_host_telemetry_patch(
-                        romeo_port=self._romeo_usb,
-                        romeo_baud=self._romeo_baud,
-                        wifi_ifname=self._wifi_ifname,
-                    ),
-                )
-                if self._signaling and hasattr(self._signaling, "push_host_telemetry"):
-                    await self._signaling.push_host_telemetry(patch)
-                    log.info(
-                        "WebRTC: telemetry → VPS batteryV=%s wifi=%s%% %s",
-                        patch.get("batteryV", "—"),
-                        patch.get("wifiSignal", "—"),
-                        patch.get("wifiSsid") or "",
-                    )
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                log.debug("WebRTC: telemetry upload failed", exc_info=True)
+            await self._push_telemetry_once()
             try:
                 await asyncio.sleep(self._telemetry_interval_sec)
             except asyncio.CancelledError:
@@ -397,8 +448,10 @@ class WebRTCHost:
         offer_data = await self._signaling.wait_for_offer(
             prev_ufrag=self._prev_ufrag,
             should_stop=lambda: not self._running,
+            power_idle=self._power_save,
         )
         self._prev_ufrag = self._signaling.last_ufrag
+        await self._enter_power_active()
 
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
@@ -805,7 +858,7 @@ async def run_webrtc_host(
     ice_turn_only: bool = False,
     romeo_usb: str | None = None,
     romeo_baud: int = 115200,
-    telemetry_interval_sec: float = 10.0,
+    telemetry_interval_sec: float = 0.0,
     wifi_ifname: str | None = None,
 ) -> None:
     """Entry point: run WebRTC host until interrupted."""
