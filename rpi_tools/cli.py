@@ -759,12 +759,11 @@ def main() -> int:
     p_webrtc.add_argument(
         "--telemetry-interval",
         type=float,
-        default=float(os.environ.get("CAMSTREAM_TELEMETRY_INTERVAL_SEC", "0")),
+        default=float(os.environ.get("CAMSTREAM_TELEMETRY_INTERVAL_SEC", "30")),
         metavar="SEC",
         help=(
-            "Legacy: периодический PUT /host каждые SEC с. "
-            "0 (по умолчанию) — только ответ на host.telemetryPing с VPS. "
-            "Env: CAMSTREAM_TELEMETRY_INTERVAL_SEC."
+            "Как часто отправлять батарею и Wi‑Fi на VPS (PUT /host). "
+            "0 — только Connect и telemetryPing. Env: CAMSTREAM_TELEMETRY_INTERVAL_SEC."
         ),
     )
     p_webrtc.add_argument(
@@ -1124,7 +1123,7 @@ def main() -> int:
                 ice_turn_only=ice_vps_only,
                 romeo_usb=romeo_usb,
                 romeo_baud=romeo_baud,
-                telemetry_interval_sec=float(getattr(args, "telemetry_interval", 10)),
+                telemetry_interval_sec=float(args.telemetry_interval),
                 wifi_ifname=wifi_if,
             ))
         except KeyboardInterrupt:
