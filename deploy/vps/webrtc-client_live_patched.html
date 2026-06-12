@@ -1,0 +1,1780 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Romeo WebRTC Operator</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', system-ui, sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+        header {
+            background: #16213e;
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #0f3460;
+        }
+        .header-actions {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        #status {
+            font-size: 0.85rem;
+            padding: 4px 12px;
+            border-radius: 12px;
+            background: #333;
+        }
+        #status.connected { background: #1b5e20; color: #a5d6a7; }
+        #status.connecting { background: #e65100; color: #ffcc80; }
+        #status.error { background: #b71c1c; color: #ef9a9a; }
+
+        .header-center {
+            flex: 1;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 6px 14px;
+            padding: 0 8px;
+            min-width: 0;
+        }
+        .telemetry-item {
+            font-size: 0.78rem;
+            color: #b0bec5;
+            white-space: nowrap;
+        }
+        .telemetry-item.telemetry--low { color: #ef9a9a; }
+        .telemetry-item.telemetry--offline { color: #ffab91; }
+        .telemetry-age {
+            font-size: 0.68rem;
+            color: #78909c;
+        }
+        @media (max-width: 520px) {
+            header { flex-wrap: wrap; gap: 8px; padding: 10px 12px; }
+            .header-center { order: 3; flex-basis: 100%; justify-content: flex-start; }
+        }
+
+        .main {
+            flex: 1;
+            display: flex;
+            overflow: hidden;
+            min-height: 0;
+        }
+        .stage {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+            background: #000;
+        }
+        .video-container {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            min-height: 180px;
+        }
+        #remoteVideo {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            min-width: 320px;
+            min-height: 240px;
+            background: #111;
+        }
+        .sr-only {
+            position: absolute;
+            width: 1px;
+            height: 1px;
+            padding: 0;
+            margin: -1px;
+            overflow: hidden;
+            clip: rect(0, 0, 0, 0);
+            white-space: nowrap;
+            border: 0;
+        }
+        .btn {
+            padding: 10px 16px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .btn-primary {
+            background: #1976d2;
+            color: #fff;
+        }
+        .btn-primary:hover { background: #1565c0; }
+        .btn-danger {
+            background: #c62828;
+            color: #fff;
+        }
+        .btn-danger:hover { background: #b71c1c; }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .control-dock {
+            flex-shrink: 0;
+            background: linear-gradient(180deg, #0d1b2a 0%, #16213e 100%);
+            border-top: 1px solid #0f3460;
+            padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+        }
+        .joystick-row {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            max-width: 520px;
+            margin: 0 auto;
+        }
+        .joystick-wrap {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            min-width: 0;
+        }
+        .joystick-wrap > .joystick-label {
+            font-size: 0.68rem;
+            color: #8ab4d4;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .joystick {
+            position: relative;
+            width: min(42vw, 150px);
+            height: min(42vw, 150px);
+            max-width: 150px;
+            max-height: 150px;
+            border-radius: 50%;
+            background: radial-gradient(circle at 35% 30%, #1a4a7a 0%, #0a1628 70%);
+            border: 2px solid #2a5a8a;
+            box-shadow: inset 0 0 20px rgba(0,0,0,0.5);
+            touch-action: none;
+        }
+        .joystick-ring {
+            position: absolute;
+            inset: 12%;
+            border-radius: 50%;
+            border: 1px dashed rgba(79, 195, 247, 0.25);
+            pointer-events: none;
+        }
+        .joystick-knob {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            width: 44%;
+            height: 44%;
+            border-radius: 50%;
+            background: linear-gradient(145deg, #4fc3f7, #1976d2);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.45);
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        }
+        .joystick--turret .joystick-knob {
+            background: linear-gradient(145deg, #81c784, #388e3c);
+        }
+        .joystick-caption {
+            display: none;
+        }
+        .joystick-mid {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        .joystick-mid .btn-round {
+            width: 48px;
+            height: 48px;
+            border-radius: 50%;
+            border: none;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .btn-home-round {
+            background: #455a64;
+            color: #fff;
+            font-size: 0.85rem;
+        }
+        .romeo-msg-row {
+            display: flex;
+            gap: 8px;
+            max-width: 520px;
+            margin: 10px auto 0;
+            align-items: center;
+        }
+        .romeo-msg-row input {
+            flex: 1;
+            min-width: 0;22
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #0f3460;
+            background: #0a1628;
+            color: #e0e0e0;
+            font-size: 0.95rem;
+        }
+        .romeo-msg-row input::placeholder {
+            color: #78909c;
+        }
+        .romeo-msg-row input:disabled {
+            opacity: 0.55;
+        }
+        .btn-msg {
+            flex-shrink: 0;
+            padding: 10px 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            touch-action: manipulation;
+        }
+        .btn-msg-send {
+            background: #1565c0;
+            color: #fff;
+        }
+        .btn-msg-send:hover { background: #1976d2; }
+        .btn-msg-clear {
+            background: #37474f;
+            color: #cfd8dc;
+        }
+        .btn-msg-clear:hover { background: #455a64; }
+        .romeo-msg-hint {
+            max-width: 520px;
+            margin: 6px auto 0;
+            font-size: 0.72rem;
+            color: #78909c;
+            text-align: center;
+        }
+        @media (min-width: 901px) {
+            .joystick { width: 130px; height: 130px; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="header-actions">
+            <button class="btn btn-primary" id="btnConnect" type="button">Connect</button>
+            <button class="btn btn-danger" id="btnDisconnect" onclick="hangup()" disabled>Disconnect</button>
+        </div>
+        <div class="header-center" id="telemetryBar">
+            <span class="telemetry-item" id="telemetryBattery">Батарея: —</span>
+            <span class="telemetry-item" id="telemetryWifi">Wi‑Fi: —</span>
+            <span class="telemetry-age" id="telemetryAge"></span>
+        </div>
+        <span id="status">Disconnected</span>
+    </header>
+
+    <div class="sr-only" aria-hidden="true">
+        <input type="text" id="inputRoomId" value="pi-camera" tabindex="-1">
+        <input type="text" id="inputIceUrl" value="" tabindex="-1">
+        <input type="text" id="inputIceToken" value="" tabindex="-1">
+    </div>
+
+    <div class="main">
+        <div class="stage">
+            <div class="video-container">
+                <video id="remoteVideo" autoplay playsinline muted></video>
+            </div>
+
+            <div class="control-dock" id="controlDock">
+                <div class="joystick-row">
+                    <div class="joystick-wrap">
+                        <span class="joystick-label">Езда</span>
+                        <div id="joyDrive" aria-label="Джойстик езды"></div>
+                    </div>
+                    <div class="joystick-mid">
+                        <button type="button" class="btn-round btn-home-round" id="btnHome" title="Home">H</button>
+                    </div>
+                    <div class="joystick-wrap">
+                        <span class="joystick-label">Камера</span>
+                        <div id="joyTurret" aria-label="Джойстик камеры"></div>
+                    </div>
+                </div>
+                <div class="romeo-msg-row">
+                    <input type="text" id="romeoMsgInput" placeholder="" maxlength="120" autocomplete="off">
+                    <button type="button" class="btn-msg btn-msg-clear" id="btnRomeoMsgClr" title="Очистить дисплей Romeo">CLR</button>
+                    <button type="button" class="btn-msg btn-msg-send" id="btnRomeoMsgSend">Отправить</button>
+                </div>
+                <p class="romeo-msg-hint">Data Channel: {"romeo":"MSG текст"} → /dev/ttyACM0</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        (function () {
+            function defaultOperatorIceUrl() {
+                const loc = window.location;
+                if (loc.protocol.startsWith("http")) {
+                    const h = loc.hostname;
+                    if (h === "127.0.0.1" || h === "localhost") {
+                        return "http://116.203.148.254:8788/api/ice";
+                    }
+                    return loc.origin.replace(/\/$/, "") + "/api/ice";
+                }
+                return "http://116.203.148.254:8788/api/ice";
+            }
+            const DEFAULT_ICE = defaultOperatorIceUrl();
+            function bootLog(msg) { if (msg) console.warn("[webrtc]", msg); }
+            function applyDefaultFields() {
+                const qs = new URLSearchParams(window.location.search);
+                const r = document.getElementById("inputRoomId");
+                const ice = document.getElementById("inputIceUrl");
+                const tok = document.getElementById("inputIceToken");
+                if (r && !r.value.trim()) {
+                    r.value = qs.get("room") || qs.get("r") || localStorage.getItem("webrtc_room") || "pi-camera";
+                }
+                if (ice && !ice.value.trim()) {
+                    ice.value = qs.get("ice") || qs.get("iceUrl") || localStorage.getItem("webrtc_ice_url") || DEFAULT_ICE;
+                }
+                if (tok && !tok.value.trim()) {
+                    tok.value = qs.get("iceToken") || localStorage.getItem("webrtc_ice_token") || "";
+                }
+            }
+            document.addEventListener("DOMContentLoaded", applyDefaultFields);
+            window.addEventListener("error", (e) => {
+                bootLog("JS: " + (e.message || "error") + " — откройте страницу из папки с webrtc-client.html или через open_webrtc_operator.ps1", "error");
+            });
+            window.addEventListener("unhandledrejection", (e) => {
+                const r = e.reason;
+                const detail = r && r.stack ? r.stack : r && r.message ? r.message : String(r);
+                bootLog("Promise: " + detail, "error");
+                bootLog(
+                    "Часто: file:// или F5 с ? в пути. Запуск: scripts\\serve_webrtc_operator.ps1 или Run → WebRTC (http localhost)",
+                    "warn",
+                );
+            });
+            window.__webrtcMarkReady = function () {
+                window.__webrtcAppReady = true;
+            };
+            ["startConnection", "hangup"].forEach((name) => {
+                window[name] = function () {
+                    bootLog("Модуль ещё не загружен — подождите или F12 → Console", "error");
+                    bootLog(
+                        window.location.hostname === "116.203.148.254"
+                            ? "Обновите Ctrl+Shift+R; F12 → Console — ошибка import/404?"
+                            : "Debug: http://116.203.148.254/cam или scripts\\serve_webrtc_operator.ps1",
+                        "warn",
+                    );
+                };
+            });
+        })();
+    </script>
+    <script type="module">
+        import {
+            createVpsOnlyPeerConnection,
+            createOperatorPeerConnection,
+            loadVpsIceServers,
+            filterSdpIceRelayOnly,
+        } from "./examples/webrtc_operator_vps_only.js";
+        import { attachVpsIceTrickle } from "./examples/webrtc_vps_ice_trickle.js";
+        import { watchPiHostOnVps } from "./examples/webrtc_vps_host_launch.js";
+        import {
+            defaultSignalApiBase,
+            signalClearCallerSide,
+            signalClearRoom,
+            signalPutOffer,
+            signalWaitEvents,
+            signalFetch,
+        } from "./examples/webrtc_vps_signaling.js";
+        import {
+            attachBrowserControlKeys,
+            romeoDriveJson,
+            romeoTurretSmoothJson,
+            romeoTurretStopJson,
+            romeoHomeJson,
+        } from "./examples/webrtc_browser_control_keys.js";
+        import { mountVirtualJoystick } from "./examples/webrtc_touch_joysticks.js";
+        import { updateHostTelemetryUi } from "./examples/webrtc_host_telemetry.js";
+        async function loadOperatorBootstrap() {
+            const qs = new URLSearchParams(window.location.search);
+            const shareMode =
+                qs.has("share") ||
+                qs.has("autostart") ||
+                /\/cam\/?$/i.test(window.location.pathname);
+            if (!shareMode && (qs.get("iceToken") || localStorage.getItem("webrtc_ice_token"))) {
+                return;
+            }
+            if (["127.0.0.1", "localhost"].includes(window.location.hostname)) {
+                return;
+            }
+            try {
+                const base = window.location.origin.replace(/\/$/, "");
+                const r = await fetch(`${base}/api/operator-bootstrap`, { cache: "no-store" });
+                if (!r.ok) {
+                    console.warn("operator-bootstrap HTTP", r.status);
+                    return;
+                }
+                const j = await r.json();
+                window.__OPERATOR_BOOTSTRAP = j;
+                const rEl = document.getElementById("inputRoomId");
+                const iceEl = document.getElementById("inputIceUrl");
+                const tokEl = document.getElementById("inputIceToken");
+                if (j.room && rEl && !qs.get("room") && !qs.get("r")) {
+                    rEl.value = j.room;
+                }
+                if (j.iceConfigUrl && iceEl) {
+                    iceEl.value = j.iceConfigUrl.startsWith("http")
+                        ? j.iceConfigUrl
+                        : `${base}${j.iceConfigUrl}`;
+                }
+                if (j.iceConfigToken && tokEl && !qs.get("iceToken")) {
+                    tokEl.value = j.iceConfigToken;
+                    try {
+                        localStorage.setItem("webrtc_ice_token", j.iceConfigToken);
+                    } catch (_) {}
+                }
+            } catch (e) {
+                console.warn("loadOperatorBootstrap", e);
+            }
+        }
+
+        await loadOperatorBootstrap();
+
+        const signalApiBase =
+            window.__OPERATOR_BOOTSTRAP?.signalApiBase?.startsWith("http")
+                ? window.__OPERATOR_BOOTSTRAP.signalApiBase
+                : defaultSignalApiBase();
+
+        /** ICE config API на VPS (`cloud/ice_config_server.py`). Перекрывается ?ice= / localStorage. */
+        function defaultOperatorIceUrl() {
+            const loc = window.location;
+            if (loc.protocol.startsWith("http")) {
+                const h = loc.hostname;
+                if (h === "127.0.0.1" || h === "localhost") {
+                    return "http://116.203.148.254:8788/api/ice";
+                }
+                return loc.origin.replace(/\/$/, "") + "/api/ice";
+            }
+            return "http://116.203.148.254:8788/api/ice";
+        }
+        const DEFAULT_ICE_CONFIG_URL = defaultOperatorIceUrl();
+        const HETZNER_ICE_HOST = "116.203.148.254";
+        const OPERATOR_PROFILE = (
+            new URLSearchParams(window.location.search).get("profile") ||
+            window.WEBRTC_OPERATOR_PROFILE ||
+            "default"
+        ).toLowerCase();
+        const HETZNER_RELAY_ONLY =
+            OPERATOR_PROFILE === "hetzner-relay-only" ||
+            OPERATOR_PROFILE === "hetzner" ||
+            new URLSearchParams(window.location.search).has("relayOnly");
+
+        /** С публичного URL (не localhost) — только TURN relay, как у Pi в поле; иначе ICE часто падает через ~15 с. */
+        const FORCE_P2P = new URLSearchParams(window.location.search).has("p2p");
+        const AUTO_RELAY_REMOTE =
+            !HETZNER_RELAY_ONLY &&
+            !FORCE_P2P &&
+            !["127.0.0.1", "localhost"].includes(window.location.hostname);
+        const USE_RELAY_ONLY = HETZNER_RELAY_ONLY || AUTO_RELAY_REMOTE;
+        let lastSignalingRoomPath = null;
+
+        function applyHetznerDebugUi() {
+            if (!HETZNER_RELAY_ONLY) {
+                return;
+            }
+            document.title = "Romeo WebRTC — Hetzner relay only (debug)";
+            const h1 = document.querySelector("header h1");
+            if (h1) {
+                h1.textContent = "WebRTC — только Hetzner (debug)";
+                h1.style.color = "#ffb74d";
+            }
+            const header = document.querySelector("header");
+            if (header && !document.getElementById("hetznerDebugBanner")) {
+                const b = document.createElement("div");
+                b.id = "hetznerDebugBanner";
+                b.style.cssText =
+                    "flex:1;margin:0 16px;padding:6px 10px;font-size:0.72rem;background:#4a148c;color:#e1bee7;border-radius:6px;text-align:center;";
+                b.textContent =
+                    "iceTransportPolicy=relay · только TURN " +
+                    HETZNER_ICE_HOST +
+                    " · прямой P2P отключён";
+                header.insertBefore(b, document.getElementById("status"));
+            }
+            const iceEl = document.getElementById("inputIceUrl");
+            if (iceEl) {
+                iceEl.readOnly = true;
+                iceEl.value = DEFAULT_ICE_CONFIG_URL;
+            }
+        }
+
+        async function logNominatedIcePath() {
+            if (!pc) {
+                return;
+            }
+            try {
+                const stats = await pc.getStats();
+                const byId = new Map();
+                stats.forEach((r) => byId.set(r.id, r));
+                stats.forEach((r) => {
+                    if (r.type !== "candidate-pair" || r.state !== "succeeded" || !r.nominated) {
+                        return;
+                    }
+                    const loc = byId.get(r.localCandidateId);
+                    const rem = byId.get(r.remoteCandidateId);
+                    const lt = loc?.candidateType || "?";
+                    const rt = rem?.candidateType || "?";
+                    log(`ICE path (nominated): ${lt} → ${rt}`, lt === "relay" && rt === "relay" ? "success" : "warn");
+                    if (HETZNER_RELAY_ONLY && (lt !== "relay" || rt !== "relay")) {
+                        log("Ожидался relay↔relay через Hetzner — проверьте TURN на Pi", "error");
+                    }
+                });
+            } catch (e) {
+                log("ICE stats: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+        }
+
+        function getRoomPath() {
+            let r = (document.getElementById("inputRoomId")?.value || "").trim();
+            if (!r) {
+                r = "pi-camera";
+            }
+            if (!r.includes("/")) {
+                return `rooms/${r}`;
+            }
+            return r;
+        }
+
+        function saveWebrtcSettings() {
+            try {
+                const tok = document.getElementById("inputIceToken").value.trim();
+                localStorage.setItem("webrtc_room", document.getElementById("inputRoomId").value.trim());
+                localStorage.setItem("webrtc_ice_url", document.getElementById("inputIceUrl").value.trim());
+                localStorage.setItem("webrtc_ice_token", tok);
+                ensureHostLaunchWatch();
+                if (!tok) {
+                    log("Saved, но ICE token пуст — будет 401", "warn");
+                } else {
+                    log(`Saved (token ${tok.length} chars) — нажмите Test ICE (VPS)`, "success");
+                }
+            } catch (e) {
+                log("localStorage: " + (e && e.message ? e.message : String(e)), "error");
+            }
+        }
+
+        (function initWebrtcSettingsFromUrl() {
+            const qs = new URLSearchParams(window.location.search);
+            const rEl = document.getElementById("inputRoomId");
+            const iceEl = document.getElementById("inputIceUrl");
+            const tokEl = document.getElementById("inputIceToken");
+            if (!rEl || !iceEl || !tokEl) {
+                return;
+            }
+            const rq = qs.get("room") || qs.get("r");
+            const iq = qs.get("ice") || qs.get("iceUrl");
+            const tq = qs.get("iceToken");
+            rEl.value = rq || localStorage.getItem("webrtc_room") || "pi-camera";
+            iceEl.value = iq || localStorage.getItem("webrtc_ice_url") || DEFAULT_ICE_CONFIG_URL;
+            tokEl.value = tq || localStorage.getItem("webrtc_ice_token") || "";
+            applyHetznerDebugUi();
+        })();
+
+        function logIceFetchResult({ iceServers, source, error }, iceUrl) {
+            if (source === "api") {
+                const turnish = iceServers.filter((s) => {
+                    const u = String(s.urls || "");
+                    return u.includes("turn:") || u.includes("turns:");
+                }).length;
+                if (HETZNER_RELAY_ONLY) {
+                    log(`ICE Hetzner: ${turnish} TURN (relay-only, без STUN/P2P)`, "success");
+                } else {
+                    log(`ICE (VPS): ${iceServers.length} entries, TURN-like: ${turnish}`, "success");
+                }
+            } else if (iceUrl && error === "HTTP 401") {
+                log("ICE 401: нужен token с VPS (show-ice-client-env.sh) → поле ниже → Save", "error");
+            } else if (iceUrl && error) {
+                log(
+                    HETZNER_RELAY_ONLY
+                        ? `ICE Hetzner failed: ${error} — Connect заблокирован`
+                        : `ICE (VPS) failed: ${error} — STUN only`,
+                    "warn",
+                );
+            } else if (!iceUrl) {
+                log("ICE URL пуст — только публичный STUN", "warn");
+            }
+        }
+
+        function getIceConfigFromUi() {
+            return {
+                iceUrl: (document.getElementById("inputIceUrl")?.value || "").trim(),
+                token: (document.getElementById("inputIceToken")?.value || "").trim(),
+            };
+        }
+
+        async function loadIceServers() {
+            const { iceUrl, token: tok } = getIceConfigFromUi();
+            const result = await loadVpsIceServers(iceUrl, tok, { relayOnly: HETZNER_RELAY_ONLY });
+            logIceFetchResult(result, iceUrl);
+            return result;
+        }
+
+        async function testIceConfig() {
+            const { iceUrl, token: tok } = getIceConfigFromUi();
+            log("Проверка ICE API…", "info");
+            let { iceServers, source, error } = await loadVpsIceServers(iceUrl, tok, {
+                relayOnly: HETZNER_RELAY_ONLY,
+            });
+            if (source === "api") {
+                for (const s of iceServers) {
+                    const u = Array.isArray(s.urls) ? s.urls.join(",") : String(s.urls || "");
+                    const kind = /turn/i.test(u) ? "TURN" : /stun/i.test(u) ? "STUN" : "ICE";
+                    log(`${kind}: ${u}`, "success");
+                }
+                log(
+                    HETZNER_RELAY_ONLY
+                        ? "ICE Hetzner OK (TURN) — Connect пойдёт только через relay"
+                        : "ICE OK — можно Connect (нужен Pi в той же Firebase-комнате)",
+                    "success",
+                );
+            } else if (error === "HTTP 401") {
+                log("ICE 401: поле «ICE token» пустое или неверное. VPS: show-ice-client-env.sh", "error");
+                log("Вставьте token → Save in this browser → Test ICE снова", "error");
+                setStatus("ICE token required", "error");
+                const tokEl = document.getElementById("inputIceToken");
+                if (tokEl) {
+                    tokEl.focus();
+                    tokEl.select();
+                }
+            } else {
+                log(`ICE test failed: ${error || "no URL"}`, "error");
+            }
+        }
+
+        let pc = null;
+        let dataChannel = null;
+        let detachIceTrickle = null;
+        let iceTrickleHandle = null;
+        let detachHostLaunch = null;
+        let signalingLoopActive = false;
+        let eventsSince = 0;
+        /** true после signalPutOffer в текущей сессии — не применять старый answer с VPS */
+        let offerWrittenForSession = false;
+        let detachControlKeys = null;
+        let connectInProgress = false;
+        let autoConnectOnNeedOffer = true;
+        let answerWaitTimer = null;
+        let connectRetryCount = 0;
+        const MAX_CONNECT_RETRIES = 8;
+        /** Счётчик typ в ICE от Pi (Firebase calleeCandidates) — для Hetzner-only диагностики */
+        let piCalleeIceStats = { host: 0, srflx: 0, relay: 0, prflx: 0, other: 0 };
+        let browserCallerIceStats = { host: 0, srflx: 0, relay: 0, prflx: 0, other: 0 };
+        let statsTimer = null;
+        let iceDiagTimer = null;
+        const telemetryEls = {
+            battery: document.getElementById("telemetryBattery"),
+            wifi: document.getElementById("telemetryWifi"),
+            age: document.getElementById("telemetryAge"),
+        };
+
+        function applyHostTelemetry(host) {
+            updateHostTelemetryUi(host, telemetryEls);
+        }
+
+        async function refreshHostTelemetryOnce() {
+            const { token: iceTok } = getIceConfigFromUi();
+            if (!iceTok) {
+                return;
+            }
+            try {
+                const host = await signalFetch(signalApiBase, getRoomPath(), ["host"], {
+                    iceToken: iceTok,
+                });
+                if (host && typeof host === "object") {
+                    applyHostTelemetry(host);
+                }
+            } catch (_) {}
+        }
+
+        function parseIceCandidateTyp(candidateStr) {
+            const m = String(candidateStr || "").match(/\btyp\s+(\w+)/i);
+            return m ? m[1].toLowerCase() : "other";
+        }
+
+        function resetPiCalleeIceStats() {
+            piCalleeIceStats = { host: 0, srflx: 0, relay: 0, prflx: 0, other: 0 };
+            browserCallerIceStats = { host: 0, srflx: 0, relay: 0, prflx: 0, other: 0 };
+        }
+
+        function noteBrowserCallerIce(candidate) {
+            const typ = candidate?.type || parseIceCandidateTyp(candidate?.candidate || "");
+            if (typ in browserCallerIceStats) {
+                browserCallerIceStats[typ] += 1;
+            } else {
+                browserCallerIceStats.other += 1;
+            }
+        }
+
+        function logBrowserCallerIceSummary() {
+            const s = browserCallerIceStats;
+            log(
+                `Браузер ICE (отправка): host=${s.host} srflx=${s.srflx} relay=${s.relay} prflx=${s.prflx}`,
+                s.relay > 0 ? "info" : "warn",
+            );
+            if (USE_RELAY_ONLY && s.relay === 0) {
+                log("Нет relay у браузера — проверьте ICE token и TURN на VPS (UDP 49160–65535)", "error");
+            }
+        }
+
+        function notePiCalleeIce(raw) {
+            const line = raw?.candidate || raw?.sdp || "";
+            const typ = parseIceCandidateTyp(line);
+            if (typ in piCalleeIceStats) {
+                piCalleeIceStats[typ] += 1;
+            } else {
+                piCalleeIceStats.other += 1;
+            }
+            return typ;
+        }
+
+        function logPiCalleeIceSummary(context) {
+            const s = piCalleeIceStats;
+            const total = s.host + s.srflx + s.relay + s.prflx + s.other;
+            log(
+                `Pi ICE (${context}): host=${s.host} srflx=${s.srflx} relay=${s.relay} prflx=${s.prflx} (всего ${total})`,
+                s.relay > 0 ? "info" : "warn",
+            );
+            if (total === 0) {
+                log(
+                    "С Pi нет callee ICE (ни в SDP answer, ни trickle VPS) — Pi: camstream_webrtc / webrtc-vps, TURN relay",
+                    "error",
+                );
+            } else if (HETZNER_RELAY_ONLY && s.relay === 0) {
+                log(
+                    "Hetzner-only: браузер только relay, Pi без relay → ICE не сойдётся. " +
+                        "На Pi: тот же ICE token + ice_transport_policy=relay (см. deploy/pi-webrtc-hetzner-relay.example.txt)",
+                    "error",
+                );
+            }
+        }
+
+        function logAnswerSdpIceTypes(sdp) {
+            if (!sdp) {
+                return;
+            }
+            const host = (sdp.match(/\btyp host\b/gi) || []).length;
+            const srflx = (sdp.match(/\btyp srflx\b/gi) || []).length;
+            const relay = (sdp.match(/\btyp relay\b/gi) || []).length;
+            if (relay > 0) {
+                piCalleeIceStats.relay += relay;
+            }
+            if (host > 0) {
+                piCalleeIceStats.host += host;
+            }
+            if (srflx > 0) {
+                piCalleeIceStats.srflx += srflx;
+            }
+            if (!USE_RELAY_ONLY) {
+                return;
+            }
+            log(`Pi answer SDP ICE: host=${host} srflx=${srflx} relay=${relay}`, relay > 0 ? "success" : "error");
+            if (relay === 0) {
+                log("В SDP answer нет typ relay — Pi не использует TURN relay", "error");
+            }
+        }
+        /** Чтобы один раз объяснить в логе про low-latency hint */
+        let lowLatencyHintLogged = false;
+
+        function applyLowLatencyVideoHints() {
+            if (!pc) {
+                return;
+            }
+            let applied = false;
+            for (const r of pc.getReceivers()) {
+                if (!r.track || r.track.kind !== "video") {
+                    continue;
+                }
+                try {
+                    if ("playoutDelayHint" in r) {
+                        r.playoutDelayHint = 0;
+                        applied = true;
+                    }
+                } catch (_) {}
+                try {
+                    if ("jitterBufferTarget" in r) {
+                        r.jitterBufferTarget = 0;
+                        applied = true;
+                    }
+                } catch (_) {}
+                try {
+                    r.track.contentHint = "motion";
+                } catch (_) {}
+            }
+            if (applied && !lowLatencyHintLogged) {
+                lowLatencyHintLogged = true;
+                log(
+                    "Браузер: low-latency video hints (playoutDelay=0, contentHint=motion)",
+                    "info",
+                );
+            }
+        }
+
+        function stopStatsTimer() {
+            if (statsTimer !== null) {
+                clearInterval(statsTimer);
+                statsTimer = null;
+            }
+        }
+
+        function stopIceDiagTimer() {
+            if (iceDiagTimer !== null) {
+                clearInterval(iceDiagTimer);
+                iceDiagTimer = null;
+            }
+        }
+
+        async function logIcePairDiagnostics(label) {
+            if (!pc) {
+                return;
+            }
+            try {
+                const stats = await pc.getStats();
+                const locals = [];
+                const remotes = [];
+                const pairs = [];
+                stats.forEach((r) => {
+                    if (r.type === "local-candidate") {
+                        locals.push(`${r.candidateType || "?"}:${r.protocol || "?"}`);
+                    } else if (r.type === "remote-candidate") {
+                        remotes.push(`${r.candidateType || "?"}:${r.protocol || "?"}`);
+                    } else if (r.type === "candidate-pair") {
+                        pairs.push(`${r.state}${r.nominated ? "*" : ""}`);
+                    }
+                });
+                log(
+                    `ICE diag (${label}): local=[${locals.join(", ") || "—"}] remote=[${remotes.join(", ") || "—"}] pairs=[${pairs.join(", ") || "—"}]`,
+                    pairs.some((p) => p.startsWith("succeeded")) ? "success" : "warn",
+                );
+            } catch (e) {
+                log("ICE diag: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+        }
+
+        function startIceCheckingDiagnostics() {
+            stopIceDiagTimer();
+            let tick = 0;
+            iceDiagTimer = setInterval(() => {
+                if (!pc) {
+                    stopIceDiagTimer();
+                    return;
+                }
+                const st = pc.iceConnectionState;
+                if (st === "connected" || st === "completed" || st === "failed" || st === "closed") {
+                    stopIceDiagTimer();
+                    return;
+                }
+                tick += 1;
+                if (tick === 1 || tick % 3 === 0) {
+                    void logIcePairDiagnostics(`checking #${tick} (${st})`);
+                }
+            }, 3000);
+        }
+
+        async function logCallerCandidatesCount() {
+            try {
+                const snap = await signalFetch(signalApiBase, getRoomPath(), []);
+                const n = snap?.callerCandidates ? Object.keys(snap.callerCandidates).length : 0;
+                log(
+                    `VPS callerCandidates (для Pi): ${n} шт.`,
+                    n >= 1 ? "info" : "warn",
+                );
+            } catch (e) {
+                log("callerCandidates: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+        }
+
+        function waitIceGathering(pcInst, timeoutMs = 6000) {
+            return new Promise((resolve) => {
+                if (pcInst.iceGatheringState === "complete") {
+                    resolve();
+                    return;
+                }
+                const onCh = () => {
+                    if (pcInst.iceGatheringState === "complete") {
+                        done();
+                    }
+                };
+                const done = () => {
+                    pcInst.removeEventListener("icegatheringstatechange", onCh);
+                    clearTimeout(t);
+                    resolve();
+                };
+                pcInst.addEventListener("icegatheringstatechange", onCh);
+                const t = setTimeout(done, timeoutMs);
+            });
+        }
+
+        function preferH264Receive(transceiver) {
+            try {
+                if (typeof RTCRtpReceiver.getCapabilities !== "function") {
+                    log("RTCRtpReceiver.getCapabilities нет — кодеки по умолчанию", "warn");
+                    return;
+                }
+                const caps = RTCRtpReceiver.getCapabilities("video");
+                if (!caps || !caps.codecs || caps.codecs.length === 0) {
+                    return;
+                }
+                const h264 = caps.codecs.filter((c) => c.mimeType.toLowerCase() === "video/h264");
+                const other = caps.codecs.filter((c) => c.mimeType.toLowerCase() !== "video/h264");
+                if (h264.length === 0) {
+                    log("Браузер не принимает H.264 — проверьте Chrome/Edge, не Firefox-only VP8", "warn");
+                    return;
+                }
+                const baselineFirst = (c) => {
+                    const fmtp = (c.sdpFmtpLine || "").toLowerCase();
+                    if (fmtp.includes("42e01f")) return 0;
+                    if (fmtp.includes("42001f")) return 1;
+                    return 2;
+                };
+                h264.sort((a, b) => baselineFirst(a) - baselineFirst(b));
+                transceiver.setCodecPreferences([...h264, ...other]);
+                log("В SDP приём видео: H.264 baseline first (" + h264.length + " варианта)", "success");
+            } catch (e) {
+                log("setCodecPreferences: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+        }
+
+        function sendDc(cmd, opts = {}) {
+            if (dataChannel && dataChannel.readyState === "open") {
+                dataChannel.send(cmd);
+                if (!opts.quiet) {
+                    log(`Sent: ${cmd}`);
+                }
+                return true;
+            }
+            if (!opts.quiet) {
+                log("Control channel not open (ждите onopen или проверьте Pi сторону)", "error");
+            }
+            return false;
+        }
+
+        function romeoRawJson(cmd) {
+            return JSON.stringify({ romeo: cmd });
+        }
+
+        let lastRomeoMsgDisplayed = "";
+
+        function setRomeoMsgDisplayed(text) {
+            lastRomeoMsgDisplayed = String(text || "");
+            const input = document.getElementById("romeoMsgInput");
+            if (!input) {
+                return;
+            }
+            input.value = lastRomeoMsgDisplayed;
+            const open = Boolean(dataChannel && dataChannel.readyState === "open");
+            input.placeholder = lastRomeoMsgDisplayed
+                ? ""
+                : open
+                  ? "Введите сообщение"
+                  : "Подключитесь (Connect) для отправки";
+        }
+
+        function sendRomeoMsg(text) {
+            const input = document.getElementById("romeoMsgInput");
+            const t = String(text ?? input?.value ?? "").trim();
+            if (!t) {
+                log("Введите текст сообщения", "warn");
+                return false;
+            }
+            if (!sendDc(romeoRawJson("MSG " + t))) {
+                return false;
+            }
+            setRomeoMsgDisplayed(t);
+            return true;
+        }
+
+        function sendRomeoMsgClr() {
+            if (!sendDc(romeoRawJson("MSGCLR"))) {
+                return false;
+            }
+            setRomeoMsgDisplayed("");
+            return true;
+        }
+
+        function updateRomeoMsgUi() {
+            const open = Boolean(dataChannel && dataChannel.readyState === "open");
+            const btnSend = document.getElementById("btnRomeoMsgSend");
+            const btnClr = document.getElementById("btnRomeoMsgClr");
+            const input = document.getElementById("romeoMsgInput");
+            if (input) {
+                input.disabled = !open;
+            }
+            if (btnSend) {
+                btnSend.disabled = !open;
+            }
+            if (btnClr) {
+                btnClr.disabled = !open;
+            }
+            setRomeoMsgDisplayed(lastRomeoMsgDisplayed);
+        }
+
+        function startWebrtcStats() {
+            stopStatsTimer();
+            let statsTick = 0;
+            let lastFramesDecoded = null;
+            let lastStatsTs = null;
+            statsTimer = setInterval(async () => {
+                if (!pc) {
+                    return;
+                }
+                try {
+                    statsTick += 1;
+                    const stats = await pc.getStats();
+                    let inbound = null;
+                    stats.forEach((r) => {
+                        if (r.type === "inbound-rtp" && r.kind === "video") {
+                            inbound = r;
+                        }
+                    });
+                    const vReceivers = pc.getReceivers().filter((x) => x.track && x.track.kind === "video");
+                    if (vReceivers.length === 0) {
+                        log("Нет video receiver — в answer нет видео m-line?", "warn");
+                    }
+                    if (inbound && inbound.packetsReceived > 0) {
+                        const fd = inbound.framesDecoded;
+                        let fpsHint = "";
+                        const now = performance.now();
+                        if (fd != null && lastFramesDecoded != null && lastStatsTs != null) {
+                            const dt = (now - lastStatsTs) / 1000;
+                            const df = fd - lastFramesDecoded;
+                            if (dt > 0.5 && df >= 0) {
+                                fpsHint = ` ~${(df / dt).toFixed(1)} fps`;
+                            }
+                        }
+                        if (fd != null) {
+                            lastFramesDecoded = fd;
+                            lastStatsTs = now;
+                        }
+                        log(
+                            `RTP video: packets=${inbound.packetsReceived} bytes=${inbound.bytesReceived} ` +
+                                `framesDecoded=${fd ?? "n/a"} keyFrames=${inbound.keyFramesDecoded ?? "n/a"}${fpsHint}`,
+                            "info",
+                        );
+                        if (fd === 0 && (inbound.bytesReceived || 0) > 5000) {
+                            log(
+                                "Пакеты идут, decode=0 — на Pi смените H.264 на Constrained Baseline (profile-level-id 42e01f) или совместимый с Chrome",
+                                "warn",
+                            );
+                        }
+                    } else {
+                        log("RTP video: 0 пакетов с Pi (трек есть, медиа по RTP не приходит)", "warn");
+                        if (statsTick === 1 || statsTick % 4 === 0) {
+                            const tr = [];
+                            stats.forEach((r) => {
+                                if (r.type === "transport") {
+                                    tr.push(
+                                        `rx=${r.bytesReceived ?? 0} tx=${r.bytesSent ?? 0} dtls=${r.dtlsState ?? "?"}`,
+                                    );
+                                }
+                            });
+                            let succeededPairs = 0;
+                            stats.forEach((r) => {
+                                if (r.type === "candidate-pair" && r.state === "succeeded") {
+                                    succeededPairs += 1;
+                                }
+                            });
+                            log(`Транспорт WebRTC: ${tr.join("; ") || "нет отчёта"} | ICE пар succeeded=${succeededPairs}`, "info");
+                            if (tr.length && tr.some((s) => /rx=[1-9]/.test(s))) {
+                                log(
+                                    "На транспорте есть rx-байты, но video RTP=0 — почти наверняка Pi не подключил камеру к WebRTC sender (после answer нужен реальный send RTP). Проверьте пайплайн на Pi.",
+                                    "error",
+                                );
+                            } else {
+                                log(
+                                    "Если rx≈0 — смотрите файрвол/NAT или добавьте TURN; если rx>0 только от data channel — всё равно чинить отправку видео на Pi.",
+                                    "info",
+                                );
+                            }
+                        }
+                    }
+                } catch (e) {
+                    log("getStats: " + (e && e.message ? e.message : String(e)), "error");
+                }
+            }, 4000);
+        }
+
+        function wireControlChannel(ch) {
+            dataChannel = ch;
+            ch.onopen = () => {
+                log(`Control channel open (label=${ch.label})`, "success");
+                updateRomeoMsgUi();
+            };
+            ch.onclose = () => {
+                log(`Control channel closed (${ch.label})`, "warn");
+                updateRomeoMsgUi();
+            };
+            ch.onerror = (e) => {
+                log("Control channel error: " + (e && e.message ? e.message : String(e)), "error");
+                updateRomeoMsgUi();
+            };
+            updateRomeoMsgUi();
+        }
+
+        function teardownSignalingListeners() {
+            signalingLoopActive = false;
+            if (typeof detachIceTrickle === "function") {
+                detachIceTrickle();
+                detachIceTrickle = null;
+                iceTrickleHandle = null;
+            }
+        }
+
+        async function applyPiAnswer(data) {
+            if (!data || !pc || pc.currentRemoteDescription) {
+                return;
+            }
+            log("Received SDP answer from Pi", "success");
+            let answerSdp = data.sdp;
+            if (USE_RELAY_ONLY && answerSdp) {
+                const filtered = filterSdpIceRelayOnly(answerSdp);
+                const dropped =
+                    (answerSdp.match(/\btyp host\b/gi) || []).length +
+                    (answerSdp.match(/\btyp srflx\b/gi) || []).length -
+                    ((filtered.match(/\btyp host\b/gi) || []).length +
+                        (filtered.match(/\btyp srflx\b/gi) || []).length);
+                if (dropped > 0) {
+                    log("Relay-only: из answer SDP убраны host/srflx Pi (остались relay)", "warn");
+                }
+                answerSdp = filtered;
+            }
+            const answer = new RTCSessionDescription({ type: data.type, sdp: answerSdp });
+            logAnswerSdpIceTypes(answer.sdp);
+            await pc.setRemoteDescription(answer);
+            log("Remote description set", "success");
+            if (iceTrickleHandle) {
+                try {
+                    const snap = await signalFetch(signalApiBase, getRoomPath(), [], { iceToken: getIceConfigFromUi().token });
+                    const n = await iceTrickleHandle.applySnapshotCandidates(snap || {});
+                    if (n > 0) {
+                        log(`Pi callee ICE из VPS snapshot: ${n}`, "success");
+                    }
+                } catch (e) {
+                    log("callee ICE snapshot: " + (e && e.message ? e.message : String(e)), "warn");
+                }
+            }
+            await iceTrickleHandle.notifyRemoteDescriptionSet();
+            await syncRemoteIceOnly();
+            for (const ms of [800, 2000, 5000]) {
+                setTimeout(() => {
+                    void syncRemoteIceOnly().then(() => {
+                        if (pc?.iceConnectionState === "checking") {
+                            logPiCalleeIceSummary(`+${ms}ms`);
+                        }
+                    });
+                }, ms);
+            }
+            logPiCalleeIceSummary("after answer");
+            applyLowLatencyVideoHints();
+            queueMicrotask(() => applyLowLatencyVideoHints());
+        }
+
+        async function runSignalingEventLoop(roomPath, iceTok) {
+            signalingLoopActive = true;
+            let answerDone = false;
+            while (signalingLoopActive && pc) {
+                try {
+                    const ev = await signalWaitEvents(signalApiBase, roomPath, eventsSince, 25, iceTok);
+                    eventsSince = ev.seq ?? eventsSince;
+                    if (ev.host) {
+                        applyHostTelemetry(ev.host);
+                        const hint = formatPiHostHint(ev.host);
+                        if (
+                            !answerDone &&
+                            offerWrittenForSession &&
+                            (ev.host.status === "waking" || ev.host.powerSave)
+                        ) {
+                            setStatus(`Connecting…${hint}`, "connecting");
+                        }
+                    }
+                    if (
+                        !answerDone &&
+                        offerWrittenForSession &&
+                        ev.offer == null &&
+                        pc.localDescription?.type === "offer"
+                    ) {
+                        await resendOfferIfCleared(roomPath, iceTok);
+                    }
+                    if (
+                        !answerDone &&
+                        offerWrittenForSession &&
+                        ev.answer &&
+                        ev.answer.sdp &&
+                        pc.localDescription?.type === "offer"
+                    ) {
+                        answerDone = true;
+                        clearAnswerWaitTimer();
+                        connectRetryCount = 0;
+                        await applyPiAnswer(ev.answer);
+                    }
+                    if (iceTrickleHandle && ev.calleeCandidates && pc.remoteDescription) {
+                        await iceTrickleHandle.applySnapshotCandidates(ev);
+                        await syncRemoteIceOnly();
+                    }
+                } catch (_) {
+                    if (signalingLoopActive) {
+                        await new Promise((r) => setTimeout(r, 800));
+                    }
+                }
+            }
+        }
+
+        function ensureHostLaunchWatch() {
+            if (typeof detachHostLaunch === "function") {
+                detachHostLaunch();
+            }
+            const { token: iceTok } = getIceConfigFromUi();
+            try {
+                detachHostLaunch = watchPiHostOnVps(
+                    signalApiBase,
+                    getRoomPath(),
+                    (info) => {
+                        const id = info.hostLaunchId != null ? String(info.hostLaunchId) : "?";
+                        log(`Pi перезапустился (${info.why}, hostLaunchId=${id})`, "warn");
+                        if (pc && pc.connectionState !== "closed") {
+                            log("Disconnect → Connect заново", "warn");
+                        }
+                        scheduleAutoConnect("pi-relaunch");
+                    },
+                    {
+                        iceToken: iceTok,
+                        onPiWaiting: (info) => {
+                            const id = info.hostLaunchId != null ? String(info.hostLaunchId) : "?";
+                            if (info.initial) {
+                                log(`Pi ждёт offer (needOffer, hostLaunchId=${id})`, "info");
+                            } else {
+                                log(`Pi снова ждёт offer (hostLaunchId=${id})`, "info");
+                            }
+                            scheduleAutoConnect("pi-waiting");
+                        },
+                        onHostUpdate: applyHostTelemetry,
+                    },
+                );
+            } catch (e) {
+                log("watchPiHost: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+        }
+
+        function scheduleAutoConnect(reason) {
+            if (!autoConnectOnNeedOffer || connectInProgress) {
+                return;
+            }
+            const tok = (document.getElementById("inputIceToken")?.value || "").trim();
+            if (!tok) {
+                return;
+            }
+            log(`Авто-Connect (${reason}) через 1 с…`, "info");
+            setTimeout(() => {
+                if (connectInProgress) {
+                    return;
+                }
+                if (pc) {
+                    void hangup().then(() => {
+                        setTimeout(() => void startConnection(), 400);
+                    });
+                    return;
+                }
+                void startConnection();
+            }, 1000);
+        }
+
+        async function syncRemoteIceOnly() {
+            if (!iceTrickleHandle || !pc) {
+                return 0;
+            }
+            const n = await iceTrickleHandle.flushPending();
+            if (n > 0) {
+                log(`Применено ${n} remote ICE (VPS)`, "success");
+            }
+            return n;
+        }
+
+        // Expose functions to global scope for inline handlers
+        window.startConnection = startConnection;
+        window.hangup = hangup;
+        window.sendCmd = sendCmd;
+        window.sendDc = sendDc;
+        window.sendRomeoMsg = sendRomeoMsg;
+        window.sendRomeoMsgClr = sendRomeoMsgClr;
+        window.saveWebrtcSettings = saveWebrtcSettings;
+
+        // ============================================================
+        // Logging
+        // ============================================================
+        function log(msg, level = "info") {
+            if (!msg) {
+                return;
+            }
+            const tag = "[webrtc]";
+            if (level === "error") {
+                console.error(tag, msg);
+            } else if (level === "warn") {
+                console.warn(tag, msg);
+            } else {
+                console.log(tag, msg);
+            }
+        }
+
+        function setStatus(text, cls) {
+            const el = document.getElementById("status");
+            el.textContent = text;
+            el.className = cls || "";
+        }
+
+        function formatPiHostHint(host) {
+            if (!host || typeof host !== "object") {
+                return "";
+            }
+            const parts = [];
+            if (host.status) {
+                parts.push(`Pi: ${host.status}`);
+            }
+            if (host.powerSave) {
+                parts.push("сон");
+            }
+            if (host.needOffer) {
+                parts.push("ждёт offer");
+            }
+            return parts.length ? ` (${parts.join(", ")})` : "";
+        }
+
+        function clearAnswerWaitTimer() {
+            if (answerWaitTimer) {
+                clearTimeout(answerWaitTimer);
+                answerWaitTimer = null;
+            }
+        }
+
+        function scheduleAnswerTimeout(roomPath, iceTok, hostHint = "") {
+            clearAnswerWaitTimer();
+            const waitMs = hostHint.includes("сон") || hostHint.includes("waking") ? 90000 : 45000;
+            answerWaitTimer = setTimeout(() => {
+                if (!pc || pc.connectionState === "connected") {
+                    return;
+                }
+                log(
+                    `Нет answer от Pi за ${Math.round(waitMs / 1000)} с${hostHint} — повтор Connect`,
+                    "warn",
+                );
+                setStatus(`Pi не ответил${hostHint} — повтор…`, "connecting");
+                connectRetryCount += 1;
+                if (connectRetryCount > MAX_CONNECT_RETRIES) {
+                    setStatus("Pi недоступен — проверьте webrtc-vps на Pi", "error");
+                    connectRetryCount = 0;
+                    return;
+                }
+                void hangup().then(() => {
+                    setTimeout(() => scheduleAutoConnect("answer-timeout"), 600);
+                });
+            }, waitMs);
+        }
+
+        async function resendOfferIfCleared(roomPath, iceTok) {
+            if (!pc || !offerWrittenForSession || pc.localDescription?.type !== "offer") {
+                return false;
+            }
+            const local = pc.localDescription;
+            await signalPutOffer(
+                signalApiBase,
+                roomPath,
+                { type: local.type, sdp: local.sdp },
+                iceTok,
+            );
+            log("Offer повторно записан (Pi очистил комнату при пробуждении)", "warn");
+            scheduleAnswerTimeout(roomPath, iceTok, formatPiHostHint());
+            return true;
+        }
+
+        // ============================================================
+        // WebRTC Connection
+        // ============================================================
+        async function startConnection() {
+            if (connectInProgress) {
+                return;
+            }
+            connectInProgress = true;
+            lowLatencyHintLogged = false;
+            log("Starting WebRTC connection...");
+            setStatus("Connecting...", "connecting");
+            document.getElementById("btnConnect").disabled = true;
+            document.getElementById("btnDisconnect").disabled = false;
+
+            teardownSignalingListeners();
+            resetPiCalleeIceStats();
+            eventsSince = 0;
+            if (dataChannel) {
+                try {
+                    dataChannel.close();
+                } catch (_) {}
+                dataChannel = null;
+            }
+            if (pc) {
+                try {
+                    pc.close();
+                } catch (_) {}
+                pc = null;
+            }
+
+            const roomPath = getRoomPath();
+            lastSignalingRoomPath = roomPath;
+            log(`Signaling room: ${roomPath}`, "info");
+
+            const { iceUrl, token: iceTok } = getIceConfigFromUi();
+            offerWrittenForSession = false;
+            try {
+                await signalClearCallerSide(signalApiBase, roomPath, iceTok);
+            } catch (e) {
+                log("signal clear caller: " + (e && e.message ? e.message : String(e)), "warn");
+            }
+
+            let iceProbe;
+            try {
+                if (USE_RELAY_ONLY) {
+                    ({ pc, iceProbe } = await createVpsOnlyPeerConnection(iceUrl, iceTok));
+                } else {
+                    ({ pc, iceProbe } = await createOperatorPeerConnection(iceUrl, iceTok, {
+                        relayOnly: false,
+                    }));
+                }
+            } catch (e) {
+                log("ICE / PC: " + (e && e.message ? e.message : String(e)), "error");
+                document.getElementById("btnConnect").disabled = false;
+                document.getElementById("btnDisconnect").disabled = true;
+                setStatus("No Hetzner TURN", "error");
+                connectInProgress = false;
+                return;
+            }
+
+            if (!HETZNER_RELAY_ONLY && iceProbe.source !== "api" && iceProbe.error === "HTTP 401") {
+                log(
+                    "Без TURN на VPS прямой P2P часто обрывается через 10–30 с. Задайте token.",
+                    "error",
+                );
+                const proceed = confirm(
+                    "ICE API 401 — TURN недоступен.\n\nПодключаться только со STUN? (нестабильно)",
+                );
+                if (!proceed) {
+                    pc.close();
+                    pc = null;
+                    document.getElementById("btnConnect").disabled = false;
+                    document.getElementById("btnDisconnect").disabled = true;
+                    setStatus("Disconnected", "");
+                    connectInProgress = false;
+                    return;
+                }
+            }
+
+            if (AUTO_RELAY_REMOTE) {
+                log(
+                    "Удалённый оператор: iceTransportPolicy=relay (TURN VPS). Локально: ?p2p=1",
+                    "info",
+                );
+            }
+            log(
+                USE_RELAY_ONLY
+                    ? `ICE relay-only: ${iceProbe.iceServers.length} TURN, iceTransportPolicy=relay`
+                    : `ICE entries: ${iceProbe.iceServers.length}`,
+                "info",
+            );
+
+            iceTrickleHandle = attachVpsIceTrickle(signalApiBase, roomPath, pc, "caller", {
+                remoteRelayOnly: USE_RELAY_ONLY,
+                iceToken: iceTok,
+                onLocalCandidate: (c) => {
+                    noteBrowserCallerIce(c);
+                    if (!USE_RELAY_ONLY) {
+                        return;
+                    }
+                    const typ = c.type || "?";
+                    log(
+                        `ICE local (${typ}): ${(c.candidate || "").slice(0, 72)}…`,
+                        typ === "relay" ? "info" : "warn",
+                    );
+                },
+                onRemoteCandidate: (raw, meta) => {
+                    if (meta.skipped) {
+                        log(`Pi ICE (${meta.typ}) пропущен — relay-only, нужен typ relay`, "warn");
+                        return;
+                    }
+                    notePiCalleeIce(raw);
+                    if (HETZNER_RELAY_ONLY) {
+                        log(
+                            meta.queued
+                                ? `Pi ICE queued (${meta.typ})`
+                                : `Pi ICE (${meta.typ}) applied`,
+                            meta.typ === "relay" ? "success" : "warn",
+                        );
+                    } else if (!meta.queued) {
+                        log(`Pi ICE (${meta.typ}) applied`, "info");
+                    }
+                },
+                onError: (err) => log("addIceCandidate: " + err.message, "error"),
+            });
+            detachIceTrickle = () => iceTrickleHandle.detach();
+            log("VPS signaling: offer/answer/ICE на " + signalApiBase, "success");
+
+            const outboundDc = pc.createDataChannel("control", {
+                ordered: false,
+                maxRetransmits: 0,
+            });
+            wireControlChannel(outboundDc);
+
+            pc.ondatachannel = (ev) => {
+                log(`Remote DataChannel (от Pi): label="${ev.channel.label}"`, "success");
+                try {
+                    if (dataChannel && dataChannel !== ev.channel) {
+                        dataChannel.close();
+                    }
+                } catch (_) {}
+                wireControlChannel(ev.channel);
+            };
+
+            // Handle incoming media tracks (video only; audio ignored)
+            pc.ontrack = async (event) => {
+                const track = event.track;
+                log("Received remote track: " + track.kind + ", id=" + track.id, "success");
+                track.enabled = true;
+                track.onmute = () => log("Remote track muted: " + track.kind, "warn");
+                track.onunmute = () => log("Remote track unmuted: " + track.kind, "success");
+                track.onended = () => log("Remote track ended: " + track.kind, "error");
+
+                if (track.kind === "audio") {
+                    track.stop();
+                    log("Аудио с Pi отключено (только видео)", "info");
+                    return;
+                }
+
+                if (track.kind === "video") {
+                    log(
+                        "Video codec hint: check Pi sends H.264 baseline/profile browsers can decode (not HEVC-only)",
+                        "info",
+                    );
+                    queueMicrotask(() => applyLowLatencyVideoHints());
+                    const video = document.getElementById("remoteVideo");
+                    const stream =
+                        event.streams && event.streams[0]
+                            ? event.streams[0]
+                            : new MediaStream([track]);
+                    video.srcObject = stream;
+                    if (typeof video.requestVideoFrameCallback === "function") {
+                        video.requestVideoFrameCallback(() =>
+                            log("Отрисован кадр в <video> (requestVideoFrameCallback)", "success"),
+                        );
+                    }
+                    try {
+                        await video.play();
+                        log("video.play() OK", "success");
+                    } catch (e) {
+                        log("video.play() failed: " + (e && e.message ? e.message : String(e)), "error");
+                    }
+                }
+            };
+
+            // Приём только видео; в SDP сначала H.264 baseline
+            const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
+            preferH264Receive(videoTransceiver);
+
+            pc.oniceconnectionstatechange = () => {
+                log(`ICE state: ${pc.iceConnectionState}`);
+                if (pc.iceConnectionState === "checking") {
+                    startIceCheckingDiagnostics();
+                }
+                if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+                    stopIceDiagTimer();
+                    clearAnswerWaitTimer();
+                    connectRetryCount = 0;
+                    setStatus(HETZNER_RELAY_ONLY ? "Connected (Hetzner)" : "Connected", "connected");
+                    log(HETZNER_RELAY_ONLY ? "WebRTC connected via Hetzner relay!" : "WebRTC connected!", "success");
+                    void logNominatedIcePath();
+                    applyLowLatencyVideoHints();
+                    startWebrtcStats();
+                } else if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
+                    stopIceDiagTimer();
+                    setStatus("Disconnected", "error");
+                    log("Connection lost", "error");
+                    logBrowserCallerIceSummary();
+                    logPiCalleeIceSummary(pc.iceConnectionState);
+                    void logIcePairDiagnostics(pc.iceConnectionState);
+                    void logCallerCandidatesCount();
+                    log(
+                        "Если pairs без succeeded: Hetzner Firewall UDP 3478 + 49160–65535; Pi — signaling VPS (pi_vps_signaling.py)",
+                        "error",
+                    );
+                    void logNominatedIcePath();
+                    stopStatsTimer();
+                }
+            };
+
+            pc.onconnectionstatechange = () => {
+                log(`Peer connection state: ${pc.connectionState}`);
+                if (pc.connectionState === "failed") {
+                    setStatus("Failed", "error");
+                    if (HETZNER_RELAY_ONLY) {
+                        logPiCalleeIceSummary("failed");
+                        log(
+                            "Hetzner-only: нужен relay↔relay. На Pi: ice_transport_policy=relay. Или оператор без ?profile=hetzner",
+                            "error",
+                        );
+                    } else {
+                        log("PC failed — проверьте TURN/firewall и Pi на VPS signaling", "error");
+                    }
+                }
+            };
+
+            await waitIceGathering(pc, 6000);
+            log(`ICE gathering: ${pc.iceGatheringState}`, "info");
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            log("Created SDP offer");
+            await signalPutOffer(signalApiBase, roomPath, { type: offer.type, sdp: offer.sdp }, iceTok);
+            offerWrittenForSession = true;
+            log("Offer written to VPS signaling");
+            void runSignalingEventLoop(roomPath, iceTok);
+            scheduleAnswerTimeout(roomPath, iceTok);
+            setTimeout(() => void logCallerCandidatesCount(), 1500);
+            connectInProgress = false;
+        }
+
+        // ============================================================
+        // Hangup
+        // ============================================================
+        async function hangup() {
+            log("Disconnecting...", "warn");
+            clearAnswerWaitTimer();
+            stopStatsTimer();
+            stopIceDiagTimer();
+            teardownSignalingListeners();
+            lowLatencyHintLogged = false;
+
+            if (dataChannel) {
+                dataChannel.close();
+                dataChannel = null;
+            }
+            if (pc) {
+                pc.close();
+                pc = null;
+            }
+            connectInProgress = false;
+
+            document.getElementById("remoteVideo").srcObject = null;
+
+            const rp = lastSignalingRoomPath || getRoomPath();
+            const { token: iceTok } = getIceConfigFromUi();
+            offerWrittenForSession = false;
+            try {
+                await signalClearCallerSide(signalApiBase, rp, iceTok);
+            } catch (_) {}
+
+            setStatus("Disconnected", "");
+            document.getElementById("btnConnect").disabled = false;
+            document.getElementById("btnDisconnect").disabled = true;
+            log("Disconnected");
+        }
+
+        // ============================================================
+        // Commands via Data Channel
+        // ============================================================
+        function sendCmd(direction) {
+            sendDc(romeoDriveJson(direction), { quiet: true });
+        }
+
+        function sendTurretDir(dir) {
+            if (dir) {
+                sendDc(romeoTurretSmoothJson(dir), { quiet: true });
+            } else {
+                sendDc(romeoTurretStopJson(), { quiet: true });
+            }
+        }
+
+        detachControlKeys = attachBrowserControlKeys((cmd) => sendDc(cmd, { quiet: true }));
+
+        mountVirtualJoystick(document.getElementById("joyDrive"), {
+            mode: "drive",
+            onDir(dir) {
+                sendCmd(dir || "stop");
+            },
+        });
+        mountVirtualJoystick(document.getElementById("joyTurret"), {
+            mode: "turret",
+            onDir(dir) {
+                sendTurretDir(dir);
+            },
+        });
+
+        document.getElementById("btnHome")?.addEventListener("click", () => sendDc(romeoHomeJson()));
+
+        const romeoMsgInput = document.getElementById("romeoMsgInput");
+        document.getElementById("btnRomeoMsgSend")?.addEventListener("click", () => {
+            sendRomeoMsg();
+        });
+        document.getElementById("btnRomeoMsgClr")?.addEventListener("click", () => {
+            sendRomeoMsgClr();
+        });
+        romeoMsgInput?.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter") {
+                ev.preventDefault();
+                sendRomeoMsg();
+            }
+        });
+        romeoMsgInput?.addEventListener("focus", () => {
+            romeoMsgInput.select();
+        });
+        updateRomeoMsgUi();
+
+        ensureHostLaunchWatch();
+        if (typeof window.__webrtcMarkReady === "function") {
+            window.__webrtcMarkReady();
+        }
+        log(`VPS room: ${getRoomPath()} · signaling ${signalApiBase}`, "info");
+        log("Operator build: 2026-06-12 (video-only, no-audio)", "success");
+        void refreshHostTelemetryOnce();
+        const qsBoot = new URLSearchParams(window.location.search);
+        const autostartShare =
+            qsBoot.has("autostart") ||
+            qsBoot.has("share") ||
+            /\/cam\/?$/i.test(window.location.pathname);
+        if (window.__OPERATOR_BOOTSTRAP) {
+            log("Настройки с сервера (ссылка /cam): room + ICE token", "success");
+        }
+        if (HETZNER_RELAY_ONLY) {
+            log("DEBUG Hetzner-only: Test ICE → Connect (только TURN, без прямого P2P)", "warn");
+        } else if (autostartShare) {
+            log("Режим /cam: нажмите Connect", "info");
+            setStatus("Нажмите Connect", "");
+        } else {
+            log("Ready. Click Connect to start.", "success");
+        }
+        if (autostartShare) {
+            ensureHostLaunchWatch();
+            const tok0 = (document.getElementById("inputIceToken")?.value || "").trim();
+            if (!tok0) {
+                log("Нет ICE token — на VPS: /etc/default/operator-bootstrap.json", "error");
+            }
+        }
+
+        document.getElementById("btnConnect")?.addEventListener("click", () => {
+            void startConnection();
+        });
+    </script>
+</body>
+</html>

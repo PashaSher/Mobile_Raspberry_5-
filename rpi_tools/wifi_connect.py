@@ -6,8 +6,12 @@ import logging
 import os
 import subprocess
 import sys
+import time
 
 log = logging.getLogger("camstream")
+
+_WIFI_RECONNECT_COOLDOWN_SEC = 120.0
+_last_wifi_fallback_attempt_mono: float = 0.0
 
 
 def _nm_run(args: list[str], *, sudo: bool, timeout: float = 120) -> subprocess.CompletedProcess[str]:
@@ -90,6 +94,171 @@ def _nm_set_autoconnect(prof: str, *, sudo: bool) -> None:
         sudo=sudo,
         timeout=15,
     )
+
+
+def connect_wifi(
+    ssid: str,
+    password: str,
+    ifname: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Подключается к сети через nmcli или профиль NM (без sys.exit).
+    Возвращает (успех, сообщение).
+    """
+    net = (ssid or "").strip()
+    pwd = (password or "").strip()
+    if not net or not pwd:
+        return False, "SSID или пароль пустой"
+
+    dev = _wifi_device(ifname)
+    cmd: list[str] = ["nmcli", "device", "wifi", "connect", net, "password", pwd]
+    if ifname:
+        cmd += ["ifname", ifname]
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except FileNotFoundError:
+        return False, "nmcli не найден"
+    except subprocess.TimeoutExpired:
+        return False, "таймаут подключения к Wi‑Fi"
+
+    err = (r.stderr or r.stdout or "").strip()
+    if r.returncode == 0:
+        msg = (r.stdout or r.stderr or "").strip()
+        prof = _active_wifi_profile_name(dev)
+        if prof:
+            _nm_set_autoconnect(prof, sudo=False)
+        return True, msg or f"подключено к «{net}»"
+
+    use_fallback = (
+        "key-mgmt" in err.lower()
+        or "property is missing" in err.lower()
+        or "not authorized" in err.lower()
+    )
+    if not use_fallback:
+        return False, err or "nmcli error"
+
+    for sudo in (False, True):
+        ok, msg = _wifi_connect_via_profile(net, pwd, dev, ifname, sudo=sudo)
+        if ok:
+            return True, msg or f"подключено к «{net}» (профиль NM)"
+        if sudo is False and ("not authorized" in msg.lower() or "permission" in msg.lower()):
+            continue
+        return False, msg or "nmcli error"
+    return False, "nmcli error"
+
+
+def resolve_wifi_fallback_config(env_path: str | None = None) -> dict[str, str | int] | None:
+    """
+    Резервная сеть при слабом сигнале: env (WIFI_FALLBACK_*) или config/wifi.local.env.
+
+    Ключи: ssid, password, threshold (0–100), ifname (optional).
+    """
+    from rpi_tools.config import PROJECT_ROOT
+
+    ssid = (os.environ.get("WIFI_FALLBACK_SSID") or "").strip()
+    pwd = (os.environ.get("WIFI_FALLBACK_PASSWORD") or "").strip()
+    pwfile = (os.environ.get("WIFI_FALLBACK_PASSWORD_FILE") or "").strip()
+    ifname = (os.environ.get("WIFI_FALLBACK_IFNAME") or os.environ.get("WIFI_IFNAME") or "").strip()
+    threshold_raw = (os.environ.get("WIFI_FALLBACK_SIGNAL_MIN") or "").strip()
+
+    path = env_path or os.environ.get("WIFI_ENV_FILE") or os.path.join(PROJECT_ROOT, "config", "wifi.local.env")
+    path = os.path.expanduser(path)
+    if os.path.isfile(path):
+        data = _parse_simple_env(path)
+        if not ssid:
+            ssid = (data.get("WIFI_FALLBACK_SSID") or "").strip()
+        if not pwd:
+            pwd_raw = data.get("WIFI_FALLBACK_PASSWORD")
+            pwd = (pwd_raw.strip() if pwd_raw else "") or ""
+        if not pwfile:
+            pwfile = (data.get("WIFI_FALLBACK_PASSWORD_FILE") or "").strip()
+        if not ifname:
+            ifname = (data.get("WIFI_FALLBACK_IFNAME") or data.get("WIFI_IFNAME") or "").strip()
+        if not threshold_raw:
+            threshold_raw = (data.get("WIFI_FALLBACK_SIGNAL_MIN") or "").strip()
+
+    if pwfile and not pwd:
+        try:
+            with open(os.path.expanduser(pwfile), encoding="utf-8") as f:
+                pwd = f.readline().strip()
+        except OSError:
+            pwd = ""
+
+    if not ssid or not pwd:
+        return None
+
+    try:
+        threshold = int(threshold_raw) if threshold_raw else 60
+    except ValueError:
+        threshold = 60
+    threshold = max(1, min(100, threshold))
+
+    out: dict[str, str | int] = {"ssid": ssid, "password": pwd, "threshold": threshold}
+    if ifname:
+        out["ifname"] = ifname
+    return out
+
+
+def maybe_reconnect_wifi_on_weak_signal(
+    ifname: str | None = None,
+    *,
+    env_path: str | None = None,
+    cooldown_sec: float = _WIFI_RECONNECT_COOLDOWN_SEC,
+) -> bool:
+    """
+    Если сигнал Wi‑Fi ниже порога — переподключается к резервной сети (WIFI_FALLBACK_*).
+
+    Возвращает True, если была попытка переподключения.
+    """
+    global _last_wifi_fallback_attempt_mono
+
+    cfg = resolve_wifi_fallback_config(env_path)
+    if not cfg:
+        return False
+
+    from rpi_tools.host_telemetry import read_wifi_status
+
+    wifi = read_wifi_status(ifname or (cfg.get("ifname") if isinstance(cfg.get("ifname"), str) else None))
+    signal = wifi.get("signal_percent")
+    current_ssid = (wifi.get("ssid") or "").strip()
+    fallback_ssid = str(cfg["ssid"])
+
+    if not wifi.get("connected") or signal is None:
+        return False
+
+    threshold = int(cfg["threshold"])
+    if signal >= threshold:
+        return False
+
+    if current_ssid == fallback_ssid:
+        log.debug(
+            "wifi-fallback: сигнал %s%% < %s%%, уже на «%s» — переподключение не нужно",
+            signal,
+            threshold,
+            fallback_ssid,
+        )
+        return False
+
+    now = time.monotonic()
+    if now - _last_wifi_fallback_attempt_mono < cooldown_sec:
+        return False
+
+    _last_wifi_fallback_attempt_mono = now
+    dev_if = ifname or (cfg.get("ifname") if isinstance(cfg.get("ifname"), str) else None)
+    log.warning(
+        "wifi-fallback: сигнал %s%% < %s%% на «%s» — переподключение к «%s»",
+        signal,
+        threshold,
+        current_ssid or "?",
+        fallback_ssid,
+    )
+    ok, msg = connect_wifi(fallback_ssid, str(cfg["password"]), dev_if)
+    if ok:
+        log.info("wifi-fallback: %s", msg)
+    else:
+        log.error("wifi-fallback: не удалось переподключиться: %s", msg)
+    return True
 
 
 def _wifi_connect_via_profile(

@@ -821,6 +821,22 @@ def main() -> int:
         metavar="SEC",
         help="Таймаут HTTP запроса за ICE JSON (по умолчанию 8 с).",
     )
+    p_webrtc.add_argument(
+        "--no-audio",
+        action="store_true",
+        help="Отключить I2S-аудио в WebRTC (только видео).",
+    )
+    p_webrtc.add_argument(
+        "--no-audio-playback",
+        action="store_true",
+        help="Только микрофон Pi → браузер; динамик/усилитель не используется (WEBRTC_AUDIO_PLAYBACK=0).",
+    )
+    p_webrtc.add_argument(
+        "--audio-alsa",
+        metavar="DEV",
+        default=None,
+        help="ALSA-устройство для I2S (по умолчанию plughw:N,0 googlevoicehat или WEBRTC_AUDIO_ALSA).",
+    )
     # Глобальный -v задаётся *до* подкоманды; дубль здесь — чтобы работало ``webrtc … -v`` (типично в Run/Debug).
     p_webrtc.add_argument(
         "-v",
@@ -1061,11 +1077,16 @@ def main() -> int:
             except ValueError as e:
                 return {"ok": False, "error": str(e)}
             parts: list[str] = []
+            motion = str(obj.get("action") or "") in (
+                "drive", "turret_smooth", "turret_stop", "home"
+            )
             for cmd_line in lines:
                 try:
                     chunk = romeo_exchange(
                         romeo_usb, romeo_baud, cmd_line,
-                        append_lf=True, read_timeout=0.45, read_idle=0.03,
+                        append_lf=True,
+                        read_timeout=0.08 if motion else 0.45,
+                        read_idle=0.02 if motion else 0.03,
                     )
                     if chunk:
                         parts.append(chunk.decode("utf-8", errors="replace"))
@@ -1125,6 +1146,13 @@ def main() -> int:
                 romeo_baud=romeo_baud,
                 telemetry_interval_sec=float(args.telemetry_interval),
                 wifi_ifname=wifi_if,
+                audio_enabled=not getattr(args, "no_audio", False),
+                audio_playback_enabled=(
+                    False
+                    if getattr(args, "no_audio_playback", False)
+                    else None
+                ),
+                audio_alsa=(getattr(args, "audio_alsa", None) or "").strip() or None,
             ))
         except KeyboardInterrupt:
             log.info("webrtc: остановка по Ctrl+C")

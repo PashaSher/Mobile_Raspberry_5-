@@ -64,6 +64,41 @@ class _VpsHttp:
             log.warning("VPS: DELETE room %s — %s (продолжаем)", self.room, e)
             return False
 
+
+    def clear_caller_side(self, *, timeout_sec: float = 3.0) -> bool:
+        """Сбросить offer и ICE браузера (X-Clear: caller)."""
+        url = self._url()
+        hdrs = self._headers(auth=True)
+        hdrs["X-Clear"] = "caller"
+        req = urllib.request.Request(url, headers=hdrs, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                resp.read()
+            return True
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log.warning("VPS: DELETE caller %s — %s (продолжаем)", self.room, e)
+            return False
+
+    def clear_callee_side(self, *, timeout_sec: float = 3.0) -> bool:
+        """Сбросить только answer/ICE Pi (X-Clear: callee), не трогая offer браузера."""
+        url = self._url()
+        hdrs = self._headers(auth=True)
+        hdrs["X-Clear"] = "callee"
+        req = urllib.request.Request(url, headers=hdrs, method="DELETE")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                resp.read()
+            return True
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            log.warning("VPS: DELETE callee %s — %s (продолжаем)", self.room, e)
+            return False
+
+    def fetch_room(self) -> dict[str, Any] | None:
+        try:
+            return self._request("GET", (), auth=True)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            return None
+
     def wait_events(self, timeout: float = 8.0) -> dict[str, Any]:
         url = (
             f"{self._url('events')}?since={self._since}"
@@ -190,22 +225,34 @@ class VpsSignaling:
             return data
         return None
 
+    @staticmethod
+    def _is_plausible_browser_offer(sdp: str) -> tuple[bool, str]:
+        """Отсекаем monitor/test fake SDP до setRemoteDescription (aiortc требует rtcp-mux)."""
+        low = (sdp or "").lower()
+        ufrag = (VpsSignaling._extract_ufrag(sdp) or "").lower()
+        if ufrag in ("testconnect", "test"):
+            return False, f"bogus ufrag={ufrag!r}"
+        if "a=rtcp-mux" not in low:
+            return False, "нет a=rtcp-mux"
+        if "m=video" not in low and "m=application" not in low:
+            return False, "нет m=video / m=application"
+        return True, ""
+
     async def reset_room_for_host_launch(self, launch_id: int) -> None:
         def _go() -> None:
             patch = {
-                # needOffer=false — браузер не делает авто-Connect (scheduleAutoConnect);
-                # Pi всё равно ждёт offer через /events.
-                "needOffer": False,
+                "needOffer": True,
                 "hostLaunchId": launch_id,
                 "hostSessionId": 0,
                 "status": "waiting",
+                "powerSave": True,
             }
             self._http.set_host(patch)
-            self._http.clear_room(timeout_sec=3.0)
+            self._http.clear_callee_side(timeout_sec=3.0)
 
         await self._run_sync(_go)
         log.info(
-            "VPS: room %r — Pi start (hostLaunchId=%s), idle/wait (needOffer=false, ручной Connect)",
+            "VPS: room %r — Pi start (hostLaunchId=%s), callee cleared (offer сохранён)",
             self._room_id,
             launch_id,
         )
@@ -238,6 +285,20 @@ class VpsSignaling:
         if isinstance(host, dict) and host.get("connectIntent"):
             return True
         return False
+
+    async def peek_new_browser_offer(self, current_ufrag: str | None) -> bool:
+        def _go() -> bool:
+            snap = self._http.fetch_room() or {}
+            offer = self._coerce_offer(snap.get("offer"))
+            if not offer:
+                return False
+            ufrag = self._extract_ufrag(offer.get("sdp", ""))
+            if not ufrag or ufrag == (current_ufrag or ""):
+                return False
+            ok, _ = self._is_plausible_browser_offer(offer.get("sdp", ""))
+            return ok
+
+        return bool(await self._run_sync(_go))
 
     async def wait_for_offer(
         self,
@@ -272,7 +333,18 @@ class VpsSignaling:
                 raise asyncio.CancelledError("VPS: stop while waiting for offer")
             offer = await _poll_once()
             if offer:
-                self._last_ufrag = self._extract_ufrag(offer.get("sdp", ""))
+                ufrag = self._extract_ufrag(offer.get("sdp", ""))
+                ok, why = self._is_plausible_browser_offer(offer.get("sdp", ""))
+                if not ok:
+                    log.warning(
+                        "VPS: пропуск offer (ufrag=%s): %s — ждём настоящий Connect",
+                        ufrag,
+                        why,
+                    )
+                    if power_idle:
+                        await self.ensure_power_listen()
+                    continue
+                self._last_ufrag = ufrag
                 log.info(
                     "VPS: received offer (type=%s, ufrag=%s)",
                     offer.get("type", "?"),
@@ -300,13 +372,15 @@ class VpsSignaling:
         """После Disconnect/обрыва: очистить SDP/ICE; needOffer=false — без авто-Connect в браузере."""
 
         def _go() -> None:
-            self._http.clear_room(timeout_sec=3.0)
-            patch: dict[str, Any] = {"needOffer": False}
+            self._http.clear_callee_side(timeout_sec=3.0)
+            self._http.clear_caller_side(timeout_sec=3.0)
+            patch: dict[str, Any] = {
+                "needOffer": True,
+                "status": "waiting",
+            }
             if power_idle:
-                patch["status"] = "idle"
                 patch["powerSave"] = True
             else:
-                patch["status"] = "waiting"
                 patch["powerSave"] = False
             if session_id is not None:
                 patch["hostSessionId"] = session_id
@@ -319,17 +393,28 @@ class VpsSignaling:
         sid = f", hostSessionId={session_id}" if session_id is not None else ""
         if power_idle:
             log.info(
-                "VPS: session ended — idle/powerSave, needOffer=false%s (ждём Connect в браузере)",
+                "VPS: session ended — waiting/powerSave, needOffer=true%s (ждём Connect в браузере)",
                 sid,
             )
         else:
             log.info(
-                "VPS: session ended — room cleared, needOffer=false%s (ждём Connect в браузере)",
+                "VPS: session ended — waiting, needOffer=true%s (ждём Connect в браузере)",
                 sid,
             )
 
     async def enter_power_idle(self, session_id: int) -> None:
         await self.end_session_for_reconnect(session_id, power_idle=True)
+
+    async def ensure_power_listen(self) -> None:
+        """Сигнал на VPS: Pi слушает комнату (камера выкл), ждём Connect."""
+
+        def _go() -> None:
+            self._http.set_host(
+                {"status": "waiting", "needOffer": True, "powerSave": True},
+                retries=1,
+            )
+
+        await self._run_sync(_go)
 
     async def enter_power_active(self) -> None:
         def _go() -> None:

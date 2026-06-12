@@ -29,7 +29,8 @@ Environment=BOOT_GPIO_STABLE_MS=400
 Environment=BOOT_GPIO_WAIT_GROUND_SEC=60
 # Если GPIO не замкнут — поднять домашний Wi‑Fi (имя из nmcli connection show):
 # Environment=CAMSTREAM_HOME_WIFI_CONN=MyHomeWiFi
-ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_webrtc.sh -- -v
+# Без -v: DEBUG-логи RTP грузят CPU и рвут WebRTC (Consent expired).
+ExecStart=/home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream-gpio-wifi-fallback.sh --wrapper /home/pavel/projects/Mobile_Raspberry_5-/scripts/camstream_webrtc.sh --
 Restart=no
 
 [Install]

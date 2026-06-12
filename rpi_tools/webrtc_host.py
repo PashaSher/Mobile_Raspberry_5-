@@ -1,4 +1,4 @@
-"""WebRTC Host на Raspberry Pi: peer connection, video track, Data Channel управления."""
+"""WebRTC Host на Raspberry Pi: video + duplex audio, Data Channel управления."""
 
 from __future__ import annotations
 
@@ -13,9 +13,11 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from aiortc import RTCIceCandidate, RTCPeerConnection
 
-    from rpi_tools.webrtc_video import H264CameraTrack
+    from aiortc import MediaStreamTrack as _VideoTrackType
 
+from rpi_tools.webrtc_audio import WebRTCAudioBridge
 from rpi_tools.webrtc_vps_signaling import VpsSignaling, make_signaling
+from rpi_tools.wifi_connect import maybe_reconnect_wifi_on_weak_signal
 
 log = logging.getLogger("camstream.webrtc")
 
@@ -146,15 +148,26 @@ def _ice_typ_from_sdp(sdp_line: str) -> str:
     return "?"
 
 
-def _peer_media_ready(pc: RTCPeerConnection) -> bool:
-    """Медиа уже идёт, хотя connectionState в aiortc может оставаться «connecting»."""
+def _peer_media_ready(
+    pc: RTCPeerConnection,
+    video_track: object | None = None,
+    *,
+    min_packets: int = 30,
+) -> bool:
+    """Медиа уже идёт; aiortc на Pi часто остаётся ice=checking при рабочем RTP через TURN."""
     if pc.connectionState == "connected":
         return True
-    return pc.iceConnectionState in ("connected", "completed")
+    if pc.iceConnectionState in ("connected", "completed"):
+        return True
+    if video_track is not None:
+        n = int(getattr(video_track, "_packets_total", 0) or 0)
+        if n >= min_packets:
+            return True
+    return False
 
 
 # После ice=disconnected ждём восстановления; дольше — завершаем сессию и ждём новый offer.
-_ICE_DISCONNECT_GRACE_SEC = 4.0
+_ICE_DISCONNECT_GRACE_SEC = 20.0
 
 
 def _env_power_save() -> bool:
@@ -188,8 +201,8 @@ async def _wait_ice_gathering_complete(pc: RTCPeerConnection, timeout_sec: float
 
 class WebRTCHost:
     """
-    Main WebRTC host: creates peer connection, attaches H.264 video,
-    handles Data Channel commands for Romeo and camera control.
+    Main WebRTC host: peer connection, H.264 video, duplex I2S audio,
+    Data Channel commands for Romeo and camera control.
     """
 
     def __init__(
@@ -217,6 +230,9 @@ class WebRTCHost:
         romeo_baud: int = 115200,
         telemetry_interval_sec: float = 30.0,
         wifi_ifname: str | None = None,
+        audio_enabled: bool | None = None,
+        audio_playback_enabled: bool | None = None,
+        audio_alsa: str | None = None,
     ) -> None:
         self._room_id = room_id
         self._signal_url = (signal_url or os.environ.get("WEBRTC_SIGNAL_URL", "")).strip() or None
@@ -249,7 +265,13 @@ class WebRTCHost:
         self._last_telemetry_ping = 0
         self._telemetry_active = False
 
-        self._video_track: H264CameraTrack | None = None
+        self._video_track: _VideoTrackType | None = None
+        self._audio_bridge = WebRTCAudioBridge(
+            enabled=audio_enabled,
+            playback_enabled=audio_playback_enabled,
+            alsa_device=audio_alsa,
+        )
+        self._audio_tx = None
         self._pc: RTCPeerConnection | None = None
         self._signaling: VpsSignaling | None = None
         self._running = False
@@ -270,22 +292,66 @@ class WebRTCHost:
             "WebRTC: streaming active — ждём Disconnect или новый offer с VPS (до %.0f с grace на disconnected)",
             _ICE_DISCONNECT_GRACE_SEC,
         )
+        last_stability_log = time.monotonic()
+        last_offer_check = 0.0
         while self._running and self._pc and not self._session_end.is_set():
             pc = self._pc
             cs = pc.connectionState
             ice = pc.iceConnectionState
-            if cs in ("failed", "closed") or ice in ("failed", "closed"):
+            pkts = int(getattr(self._video_track, "_packets_total", 0) or 0)
+            media_up = _peer_media_ready(pc, self._video_track)
+            now = time.monotonic()
+            if now - last_stability_log >= 30.0:
+                last_stability_log = now
+                log.info(
+                    "WebRTC: stability tick connection=%s ice=%s packets=%d media_up=%s",
+                    cs,
+                    ice,
+                    pkts,
+                    media_up,
+                )
+            if (
+                self._signaling
+                and self._prev_ufrag
+                and now - last_offer_check >= 1.5
+            ):
+                last_offer_check = now
+                peek = getattr(self._signaling, "peek_new_browser_offer", None)
+                if callable(peek):
+                    try:
+                        if await peek(self._prev_ufrag):
+                            log.info(
+                                "WebRTC: новый offer на VPS (ufrag≠%s) — завершаем сессию для reconnect",
+                                self._prev_ufrag,
+                            )
+                            self._request_session_end("browser reconnect offer")
+                            break
+                    except Exception:
+                        log.debug("WebRTC: peek_new_browser_offer", exc_info=True)
+
+            if cs == "closed" or ice == "closed":
                 self._request_session_end(f"poll {cs}/{ice}")
                 break
-            if cs == "disconnected" or ice == "disconnected":
-                now = time.monotonic()
-                if self._disconnect_since is None:
-                    self._disconnect_since = now
-                elif now - self._disconnect_since >= _ICE_DISCONNECT_GRACE_SEC:
-                    self._request_session_end(
-                        f"disconnected >{_ICE_DISCONNECT_GRACE_SEC:.0f}s ({cs}/{ice})"
-                    )
-                    break
+            if cs in ("failed", "disconnected") or ice in ("failed", "disconnected"):
+                # ice=failed = браузер не получит видео; старые pkts не отменяют таймер
+                tolerate = media_up and ice not in ("failed",) and cs not in ("failed",)
+                if tolerate:
+                    self._disconnect_since = None
+                else:
+                    if self._disconnect_since is None:
+                        self._disconnect_since = now
+                        log.warning(
+                            "WebRTC: нестабильность %s/%s — grace %.0fs (media_up=%s)",
+                            cs,
+                            ice,
+                            _ICE_DISCONNECT_GRACE_SEC,
+                            media_up,
+                        )
+                    elif now - self._disconnect_since >= _ICE_DISCONNECT_GRACE_SEC:
+                        self._request_session_end(
+                            f"unstable >{_ICE_DISCONNECT_GRACE_SEC:.0f}s ({cs}/{ice} pkts={pkts})"
+                        )
+                        break
             else:
                 self._disconnect_since = None
             try:
@@ -452,8 +518,25 @@ class WebRTCHost:
                 self._telemetry_task = None
 
     async def _telemetry_push_loop(self) -> None:
-        """Периодический PUT /host только пока активна сессия."""
+        """Периодический PUT /host и мониторинг Wi‑Fi (слабый сигнал → fallback)."""
+        wifi_interval = max(
+            15.0,
+            self._telemetry_interval_sec if self._telemetry_interval_sec > 0 else 30.0,
+        )
+        next_wifi_check = 0.0
         while self._running:
+            now = time.monotonic()
+            if now >= next_wifi_check:
+                next_wifi_check = now + wifi_interval
+                loop = asyncio.get_running_loop()
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: maybe_reconnect_wifi_on_weak_signal(self._wifi_ifname),
+                    )
+                except Exception:
+                    log.debug("WebRTC: wifi-fallback check failed", exc_info=True)
+
             if self._telemetry_active:
                 await self._push_telemetry_once(trigger="periodic")
                 try:
@@ -485,7 +568,7 @@ class WebRTCHost:
         from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 
         from rpi_tools.webrtc_ice_config import build_rtc_ice_servers
-        from rpi_tools.webrtc_video import H264CameraTrack
+        from rpi_tools.webrtc_video import make_h264_track
 
         ice_servers = await build_rtc_ice_servers(
             ice_config_url=self._ice_config_url,
@@ -503,6 +586,7 @@ class WebRTCHost:
         log.info("WebRTC: peer connection created")
 
         v_tx = self._pc.addTransceiver("video", direction="sendrecv")
+        self._audio_tx = None
         try:
             prefs = _pref_video_codec_preferences_for_answer()
             if prefs:
@@ -526,28 +610,54 @@ class WebRTCHost:
 
             @channel.on("message")
             def on_msg(msg):
-                self._handle_data_channel_message(channel, msg)
+                if self._async_loop:
+                    asyncio.ensure_future(
+                        self._handle_data_channel_message_async(channel, msg)
+                    )
+                else:
+                    self._handle_data_channel_message(channel, msg)
 
         @self._pc.on("datachannel")
         def on_datachannel(channel):
             log.info("WebRTC: Data Channel от клиента label=%r", channel.label)
             _wire_data_channel(channel)
 
+        @self._pc.on("track")
+        def on_track(track):
+            if track.kind != "audio" or not self._audio_bridge.enabled:
+                return
+            if not self._audio_bridge.playback_enabled:
+                log.info("WebRTC: remote audio track игнорируется (динамик отключён)")
+                return
+            log.info("WebRTC: remote audio track (браузер → усилитель)")
+            asyncio.ensure_future(self._audio_bridge.start_playback(track))
+
         @self._pc.on("connectionstatechange")
         async def on_connection_state_change():
+            if not self._pc:
+                return
             state = self._pc.connectionState
             ice = self._pc.iceConnectionState
-            log.info("WebRTC: connection state -> %s (ice=%s)", state, ice)
+            pkts = int(getattr(self._video_track, "_packets_total", 0) or 0)
+            log.info(
+                "WebRTC: connection state -> %s (ice=%s packets=%d)",
+                state,
+                ice,
+                pkts,
+            )
             if state == "connected":
                 await self._signaling.set_status("connected")
-            elif state in ("failed", "closed", "disconnected"):
+            elif state == "closed":
                 self._request_session_end(f"connection={state} (ice={ice})")
 
         @self._pc.on("iceconnectionstatechange")
         async def on_ice_state():
+            if not self._pc:
+                return
             ice = self._pc.iceConnectionState
-            log.info("WebRTC: ICE state -> %s", ice)
-            if ice in ("failed", "closed"):
+            pkts = int(getattr(self._video_track, "_packets_total", 0) or 0)
+            log.info("WebRTC: ICE state -> %s (packets=%d)", ice, pkts)
+            if ice == "closed":
                 self._request_session_end(f"ice={ice}")
 
         local_ice_typs: list[str] = []
@@ -582,11 +692,35 @@ class WebRTCHost:
         await self._pc.setRemoteDescription(offer)
         log.info("WebRTC: remote description set")
 
-        # В offer нет m=application — браузер не поднял SCTP; создаём канал с Pi (часть старых страниц).
         offer_sdp = offer_data.get("sdp", "")
+        if self._audio_bridge.enabled:
+            for tx in self._pc.getTransceivers():
+                if tx.kind == "audio":
+                    self._audio_tx = tx
+                    log.info(
+                        "WebRTC: audio transceiver из offer (direction=%s, ALSA %s)",
+                        getattr(tx, "direction", "?"),
+                        self._audio_bridge.alsa_device,
+                    )
+                    break
+            if self._audio_tx is None:
+                log.info(
+                    "WebRTC: offer без m=audio — Pi mic/динамик только если браузер шлёт audio"
+                )
+        else:
+            for tx in self._pc.getTransceivers():
+                if tx.kind == "audio":
+                    tx.direction = "inactive"
+            log.info("WebRTC: аудио отключено (WEBRTC_AUDIO=0) — только видео + управление")
+
+        # В offer нет m=application — браузер не поднял SCTP; создаём канал с Pi (часть старых страниц).
         if "m=application" not in offer_sdp.lower():
             try:
-                dc_pi = self._pc.createDataChannel("romeo", ordered=True)
+                dc_pi = self._pc.createDataChannel(
+                    "romeo",
+                    ordered=False,
+                    maxRetransmits=0,
+                )
                 _wire_data_channel(dc_pi)
                 log.info(
                     "WebRTC: в SDP не было SCTP — создан исходящий DataChannel %r со стороны Pi",
@@ -642,7 +776,7 @@ class WebRTCHost:
             "WebRTC: rpicam camera args для этой сессии: %s",
             " ".join(cam_args or []) or "(libcamera defaults)",
         )
-        self._video_track = H264CameraTrack(
+        self._video_track = make_h264_track(
             width=self._video_width,
             height=self._video_height,
             fps=self._video_fps,
@@ -669,6 +803,20 @@ class WebRTCHost:
         log.info(
             "WebRTC: H.264-трек привязан к трансоверу (replaceTrack) перед createAnswer"
         )
+
+        if self._audio_tx is not None:
+            self._audio_tx.direction = (
+                "sendrecv" if self._audio_bridge.playback_enabled else "sendonly"
+            )
+            mic_track = self._audio_bridge.start_capture()
+            if mic_track is not None:
+                self._audio_tx.sender.replaceTrack(mic_track)
+                log.info(
+                    "WebRTC: I2S-микрофон привязан к audio transceiver (direction=%s)",
+                    self._audio_tx.direction,
+                )
+            else:
+                log.warning("WebRTC: микрофон недоступен — audio send отключён")
 
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
@@ -719,13 +867,13 @@ class WebRTCHost:
             """Poll for late candidates, then signal end-of-candidates."""
             for _ in range(20):
                 await asyncio.sleep(1.0)
-                if not self._pc or _peer_media_ready(self._pc):
+                if not self._pc or _peer_media_ready(self._pc, self._video_track):
                     return
                 candidates = await self._signaling.poll_remote_candidates()
                 for c_data in candidates:
                     _add_candidate(c_data)
 
-            if self._pc and not _peer_media_ready(self._pc):
+            if self._pc and not _peer_media_ready(self._pc, self._video_track):
                 log.info("WebRTC: signaling end-of-candidates")
                 try:
                     await self._pc.addIceCandidate(None)
@@ -743,26 +891,89 @@ class WebRTCHost:
             if pc.iceConnectionState in ("failed", "closed"):
                 log.info("WebRTC: ICE %s — ending session", pc.iceConnectionState)
                 break
-            if _peer_media_ready(pc):
+            if _peer_media_ready(pc, self._video_track):
+                pkts = int(getattr(self._video_track, "_packets_total", 0) or 0)
                 log.info(
-                    "WebRTC: media path up (connection=%s ice=%s)",
+                    "WebRTC: media path up (connection=%s ice=%s packets=%d)",
                     pc.connectionState,
                     pc.iceConnectionState,
+                    pkts,
                 )
                 break
             if asyncio.get_event_loop().time() > deadline:
+                pkts = int(getattr(self._video_track, "_packets_total", 0) or 0)
                 log.warning(
-                    "WebRTC: connect timeout (60s, connection=%s ice=%s) — ending session",
+                    "WebRTC: connect timeout (60s, connection=%s ice=%s packets=%d) — ending session",
                     pc.connectionState,
                     pc.iceConnectionState,
+                    pkts,
                 )
                 break
             await asyncio.sleep(0.3)
 
         poll_task.cancel()
 
-        if self._pc and _peer_media_ready(self._pc):
+        if self._pc and _peer_media_ready(self._pc, self._video_track):
             await self._await_session_end()
+
+
+    _MOTION_ACTIONS = frozenset({"drive", "turret_smooth", "turret_stop", "home"})
+
+    def _dc_action(self, obj: dict) -> str | None:
+        a = obj.get("action")
+        return a if isinstance(a, str) else None
+
+    async def _handle_data_channel_message_async(
+        self, channel, message: str | bytes
+    ) -> None:
+        if isinstance(message, bytes):
+            message = message.decode("utf-8", errors="replace")
+        text = message.strip()
+        if not text:
+            return
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            obj = {"romeo": text}
+        action = self._dc_action(obj)
+        silent = action in self._MOTION_ACTIONS
+        loop = self._async_loop or asyncio.get_event_loop()
+        if self._command_handler:
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: self._command_handler(obj)
+                    or {"ok": False, "error": "no handler"},
+                )
+            except Exception as e:
+                response = {"ok": False, "error": str(e)}
+        else:
+            response = {"ok": False, "error": "no command handler configured"}
+        if (
+            isinstance(response, dict)
+            and response.get("changed")
+            and str(response.get("camera_action", "")).startswith("camera_")
+            and self._video_track
+            and self._camera_args_provider
+            and self._async_loop
+        ):
+            cam_args = self._current_camera_args()
+            asyncio.run_coroutine_threadsafe(
+                self._restart_rpicam_with_args(cam_args),
+                self._async_loop,
+            )
+            log.info(
+                "WebRTC: rpicam перезапуск после %s, args=%s",
+                response.get("camera_action"),
+                " ".join(cam_args),
+            )
+        if silent:
+            return
+        if channel and channel.readyState == "open":
+            try:
+                channel.send(json.dumps(response, ensure_ascii=False))
+            except Exception:
+                log.debug("WebRTC: failed to send DC response")
 
     def _handle_data_channel_message(self, channel, message: str | bytes) -> None:
         if isinstance(message, bytes):
@@ -824,6 +1035,11 @@ class WebRTCHost:
         if self._video_track:
             self._video_track.stop()
             self._video_track = None
+        try:
+            await self._audio_bridge.stop()
+        except Exception:
+            log.debug("WebRTC: audio bridge stop", exc_info=True)
+        self._audio_tx = None
         self._kill_stale_rpicam()
         if self._pc:
             try:
@@ -889,6 +1105,9 @@ async def run_webrtc_host(
     romeo_baud: int = 115200,
     telemetry_interval_sec: float = 30.0,
     wifi_ifname: str | None = None,
+    audio_enabled: bool | None = None,
+    audio_playback_enabled: bool | None = None,
+    audio_alsa: str | None = None,
 ) -> None:
     """Entry point: run WebRTC host until interrupted."""
     try:
@@ -924,6 +1143,9 @@ async def run_webrtc_host(
         romeo_baud=romeo_baud,
         telemetry_interval_sec=telemetry_interval_sec,
         wifi_ifname=wifi_ifname,
+        audio_enabled=audio_enabled,
+        audio_playback_enabled=audio_playback_enabled,
+        audio_alsa=audio_alsa,
     )
 
     loop = asyncio.get_event_loop()

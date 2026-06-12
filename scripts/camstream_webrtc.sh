@@ -35,6 +35,26 @@ set +a
 
 ROOM="${WEBRTC_ROOM:-pi-camera}"
 
+# WiFi power_save → пропуски UDP → ICE «Consent expired» и обрыв через 10–30 с.
+_wifi_ps_off() {
+  local wif="$1"
+  iw dev "$wif" info >/dev/null 2>&1 || return 0
+  if iw dev "$wif" set power_save off 2>/dev/null; then
+    echo "[camstream_webrtc] ${wif}: power_save off" >&2
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n iw dev "$wif" set power_save off 2>/dev/null; then
+    echo "[camstream_webrtc] ${wif}: power_save off (sudo)" >&2
+    return 0
+  fi
+  echo "[camstream_webrtc] ${wif}: power_save не выключен (нужен sudo iw … set power_save off)" >&2
+}
+if command -v iw >/dev/null 2>&1; then
+  for wif in wlan0 wlan1; do
+    _wifi_ps_off "$wif"
+  done
+fi
+
 # Как в launch.json «RPI: debug (webrtc)»: -v перед подкомандой webrtc.
 extra=()
 want_v=0
@@ -48,6 +68,33 @@ done
 
 args=()
 (( want_v )) && args+=(-v)
-args+=(webrtc --room "${ROOM}" --ice-vps-only "${extra[@]}")
+args+=(webrtc --room "${ROOM}")
+# relay-only через VPS (по умолчанию). CAMSTREAM_ICE_VPS_ONLY=0 — STUN/P2P, если оператор с ?p2p=1 в одной сети.
+if [[ "${CAMSTREAM_ICE_VPS_ONLY:-1}" != "0" ]]; then
+  args+=(--ice-vps-only)
+fi
+args+=("${extra[@]}")
+if [[ -n "${CAMSTREAM_VIDEO_BITRATE:-}" ]]; then
+  args+=(--video-bitrate "${CAMSTREAM_VIDEO_BITRATE}")
+fi
+if [[ -n "${CAMSTREAM_VIDEO_FPS:-}" ]]; then
+  args+=(--fps "${CAMSTREAM_VIDEO_FPS}")
+fi
+if [[ -n "${CAMSTREAM_VIDEO_WIDTH:-}" ]]; then
+  args+=(--width "${CAMSTREAM_VIDEO_WIDTH}")
+fi
+if [[ -n "${CAMSTREAM_VIDEO_HEIGHT:-}" ]]; then
+  args+=(--height "${CAMSTREAM_VIDEO_HEIGHT}")
+fi
+if [[ -n "${CAMSTREAM_VIDEO_INTRA:-}" ]]; then
+  args+=(--video-intra "${CAMSTREAM_VIDEO_INTRA}")
+fi
+if [[ "${WEBRTC_AUDIO:-1}" == "0" ]]; then
+  args+=(--no-audio)
+else
+  if [[ "${WEBRTC_AUDIO_PLAYBACK:-1}" == "0" ]]; then
+    args+=(--no-audio-playback)
+  fi
+fi
 
 exec "${PY}" "${SCRIPT}" "${args[@]}"
