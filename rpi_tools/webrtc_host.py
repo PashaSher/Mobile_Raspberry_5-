@@ -15,8 +15,13 @@ if TYPE_CHECKING:
 
     from aiortc import MediaStreamTrack as _VideoTrackType
 
-from rpi_tools.webrtc_audio import WebRTCAudioBridge
+from rpi_tools.webrtc_audio import (
+    WebRTCAudioBridge,
+    apply_low_priority_audio_sdp,
+    limit_audio_sender_bitrate,
+)
 from rpi_tools.webrtc_vps_signaling import VpsSignaling, make_signaling
+from rpi_tools.audio_relay_dc import AudioDcRelay, dc_audio_enabled
 from rpi_tools.wifi_connect import maybe_reconnect_wifi_on_weak_signal
 
 log = logging.getLogger("camstream.webrtc")
@@ -272,6 +277,10 @@ class WebRTCHost:
             alsa_device=audio_alsa,
         )
         self._audio_tx = None
+        self._audio_dc_relay = None
+        self._audio_dc = None
+        self._listen_active = False
+        self._ptl_track = None
         self._pc: RTCPeerConnection | None = None
         self._signaling: VpsSignaling | None = None
         self._running = False
@@ -805,18 +814,15 @@ class WebRTCHost:
         )
 
         if self._audio_tx is not None:
-            self._audio_tx.direction = (
-                "sendrecv" if self._audio_bridge.playback_enabled else "sendonly"
+            self._audio_bridge.reset_push_to_listen_track()
+            self._ptl_track = self._audio_bridge.get_push_to_listen_track()
+            self._audio_tx.direction = "sendonly"
+            self._audio_tx.sender.replaceTrack(self._ptl_track)
+            log.info(
+                "WebRTC: gated audio track — микрофон по pi_listen (ALSA %s, 48 kHz)",
+                self._audio_bridge.alsa_device,
             )
-            mic_track = self._audio_bridge.start_capture()
-            if mic_track is not None:
-                self._audio_tx.sender.replaceTrack(mic_track)
-                log.info(
-                    "WebRTC: I2S-микрофон привязан к audio transceiver (direction=%s)",
-                    self._audio_tx.direction,
-                )
-            else:
-                log.warning("WebRTC: микрофон недоступен — audio send отключён")
+
 
         answer = await self._pc.createAnswer()
         await self._pc.setLocalDescription(answer)
@@ -852,7 +858,7 @@ class WebRTCHost:
         except Exception as ex:
             log.debug("WebRTC: лог кодеков: %s", ex)
 
-        answer_sdp = self._pc.localDescription.sdp
+        answer_sdp = apply_low_priority_audio_sdp(self._pc.localDescription.sdp)
         await _publish_sdp_candidates_to_firebase(
             self._signaling,
             answer_sdp,
@@ -917,6 +923,28 @@ class WebRTCHost:
             await self._await_session_end()
 
 
+
+    async def _set_pi_listen(self, on: bool) -> None:
+        if not self._audio_bridge.enabled or self._ptl_track is None:
+            log.warning("WebRTC: pi_listen — нет gated audio track")
+            return
+        if on:
+            if self._listen_active:
+                return
+            if not self._ptl_track.set_listen(True):
+                log.warning("WebRTC: pi_listen ON — микрофон недоступен")
+                return
+            self._listen_active = True
+            if self._audio_tx is not None:
+                await limit_audio_sender_bitrate(self._audio_tx.sender)
+            log.info("WebRTC: pi_listen ON — микрофон")
+            return
+        if not self._listen_active:
+            return
+        self._listen_active = False
+        self._ptl_track.set_listen(False)
+        log.info("WebRTC: pi_listen OFF — только видео")
+
     _MOTION_ACTIONS = frozenset({"drive", "turret_smooth", "turret_stop", "home"})
 
     def _dc_action(self, obj: dict) -> str | None:
@@ -936,6 +964,9 @@ class WebRTCHost:
         except json.JSONDecodeError:
             obj = {"romeo": text}
         action = self._dc_action(obj)
+        if action == "pi_listen":
+            await self._set_pi_listen(bool(obj.get("on")))
+            return
         silent = action in self._MOTION_ACTIONS
         loop = self._async_loop or asyncio.get_event_loop()
         if self._command_handler:
@@ -1036,6 +1067,10 @@ class WebRTCHost:
             self._video_track.stop()
             self._video_track = None
         try:
+            if self._audio_dc_relay:
+                self._audio_dc_relay.stop()
+                self._audio_dc_relay = None
+                self._audio_dc = None
             await self._audio_bridge.stop()
         except Exception:
             log.debug("WebRTC: audio bridge stop", exc_info=True)
